@@ -130,7 +130,12 @@ export default function TerminalScreen() {
       let bin = '';
       frame.payload.forEach((b) => (bin += String.fromCharCode(b)));
       const b64 = btoa(bin);
-      webviewRef.current?.injectJavaScript(`window.__termWrite(${JSON.stringify(b64)});true;`);
+      // Guard __termWrite: a frame can arrive in the brief window before the
+      // WebView has loaded xterm.js and defined the function. Skipping it then
+      // is safe — attach() replays scrollback once the WebView is ready.
+      webviewRef.current?.injectJavaScript(
+        `if(window.__termWrite){window.__termWrite(${JSON.stringify(b64)});}true;`
+      );
     };
 
     refreshList();
