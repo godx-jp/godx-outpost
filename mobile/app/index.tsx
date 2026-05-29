@@ -22,7 +22,8 @@ import {
 } from 'react-native';
 import { wsClient } from '../lib/ws';
 
-const STORAGE_KEY = 'remote-host:last-pair';
+// SecureStore keys may only contain alphanumerics, ".", "-", "_" (no ":").
+const STORAGE_KEY = 'remote_host_last_pair';
 const DEFAULT_URL = 'ws://127.0.0.1:8722';
 
 interface QRPayload {
@@ -56,7 +57,14 @@ export default function PairScreen() {
       setStatus('pairing');
       await wsClient.pair(code);
 
-      await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify({ url, pairingCode: code }));
+      // Remember the host for convenience — best-effort only: a storage failure
+      // (e.g. SecureStore unavailable on web) must not fail an otherwise-
+      // successful pairing.
+      try {
+        await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify({ url }));
+      } catch {
+        /* ignore — pairing already succeeded */
+      }
       setStatus('paired');
     } catch (e) {
       setErrorMsg((e as Error).message ?? 'Pairing failed');
