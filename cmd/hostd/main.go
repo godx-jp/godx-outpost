@@ -84,10 +84,10 @@ func versionCmd() *cobra.Command {
 
 // ---- helpers -----------------------------------------------------------------
 
-// pairingBlock prints a fresh pairing QR code (and raw payload) for mgr.
-// It is shared by both the "start" and "pair" sub-commands.
-func pairingBlock(mgr *auth.Manager, wsURL string) {
-	code := mgr.StartPairing(2 * time.Minute)
+// pairingBlock prints a fresh pairing QR code (and raw payload) for mgr, valid
+// for ttl. Shared by both the "start" and "pair" sub-commands.
+func pairingBlock(mgr *auth.Manager, wsURL string, ttl time.Duration) {
+	code := mgr.StartPairing(ttl)
 	payload := qr.PairingPayload(wsURL, mgr.DeviceID(), code)
 
 	fmt.Println()
@@ -96,7 +96,7 @@ func pairingBlock(mgr *auth.Manager, wsURL string) {
 	}
 	fmt.Printf("\nPairing payload : %s\n", payload)
 	fmt.Printf("Device ID       : %s\n", mgr.DeviceID())
-	fmt.Printf("Pairing code    : %s  (valid 2 min)\n\n", code)
+	fmt.Printf("Pairing code    : %s  (valid %s)\n\n", code, ttl)
 }
 
 // makeHandlers returns a FRESH slice of channel.Handler values. It is called
@@ -116,6 +116,7 @@ func makeHandlers() []channel.Handler {
 func startCmd() *cobra.Command {
 	var bind string
 	var port string
+	var pairTTL time.Duration
 
 	cmd := &cobra.Command{
 		Use:   "start",
@@ -137,7 +138,7 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 			srv := server.New(mgr, makeHandlers)
 
 			// Print the pairing QR before blocking.
-			pairingBlock(mgr, wsURL)
+			pairingBlock(mgr, wsURL, pairTTL)
 
 			// Run until SIGINT / SIGTERM.
 			ctx, cancel := context.WithCancel(context.Background())
@@ -160,6 +161,7 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 
 	cmd.Flags().StringVar(&bind, "bind", "127.0.0.1", "bind address")
 	cmd.Flags().StringVar(&port, "port", "8722", "listen port")
+	cmd.Flags().DurationVar(&pairTTL, "pair-ttl", 2*time.Minute, "how long the pairing code stays valid (e.g. 30m for slow/manual pairing)")
 	return cmd
 }
 
@@ -181,7 +183,7 @@ or to inspect the pairing payload for debugging.`,
 			// Use a placeholder URL; the user is expected to edit the relay/tunnel
 			// URL in their config before sharing with a remote device.
 			wsURL := "ws://127.0.0.1:8722"
-			pairingBlock(mgr, wsURL)
+			pairingBlock(mgr, wsURL, 2*time.Minute)
 			return nil
 		},
 	}
