@@ -166,6 +166,12 @@ export class Client {
    *  caller can persist them against the right host. */
   onTokens: ((access: string, refresh: string) => void) | null = null;
 
+  // Which host this connection currently targets. Set by the Hosts screen on
+  // connect/pair so per-host screens (Terminal/Files/Monitor) can detect a
+  // switch and refresh. Not used by the transport itself.
+  activeHostId: string | null = null;
+  activeHostName: string | null = null;
+
   // Active host's credentials, held in memory (persistence is per-host, in
   // lib/hosts.ts). Seed via setTokens() before connect()/resume().
   private _access:  string | null = null;

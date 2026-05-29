@@ -8,7 +8,8 @@
  * Full implementation will support read, write, rename, delete.
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import { useFocusEffect } from 'expo-router';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -42,6 +43,7 @@ export default function FilesScreen() {
   cwdRef.current = cwd;
   // Path of the in-flight list request; promoted to cwd when it succeeds.
   const pendingPathRef = useRef('~');
+  const lastHostRef = useRef<string | null>(wsClient.activeHostId);
 
   useEffect(() => {
     if (!wsClient.isConnected) return;
@@ -82,10 +84,23 @@ export default function FilesScreen() {
     wsClient.send({ ch: Ch.FS, type: 'list', data: { path } });
   };
 
+  // Files are per-host: when the active host changed (switched on the Hosts
+  // tab), reset to the new host's home directory on focus.
+  useFocusEffect(
+    useCallback(() => {
+      if (wsClient.activeHostId !== lastHostRef.current) {
+        lastHostRef.current = wsClient.activeHostId;
+        setEntries([]);
+        setError('');
+        listDir('~');
+      }
+    }, []),
+  );
+
   if (!wsClient.isConnected) {
     return (
       <View style={styles.center}>
-        <Text style={styles.notice}>Not paired. Go to the Pair tab first.</Text>
+        <Text style={styles.notice}>No host connected. Go to the Hosts tab and connect.</Text>
       </View>
     );
   }

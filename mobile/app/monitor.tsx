@@ -8,7 +8,8 @@
  * The metric shape mirrors internal/sys/sys.go exactly.
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import { useFocusEffect } from 'expo-router';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { Ch, type Envelope } from '../lib/protocol';
 import { wsClient } from '../lib/ws';
@@ -34,6 +35,7 @@ export default function MonitorScreen() {
   const [paused, setPaused] = useState(false);
   const pausedRef           = useRef(paused);
   pausedRef.current         = paused;
+  const lastHostRef         = useRef<string | null>(wsClient.activeHostId);
 
   useEffect(() => {
     if (!wsClient.isConnected) return;
@@ -58,10 +60,28 @@ export default function MonitorScreen() {
     };
   }, []);
 
+  // Metrics are per-host: when the active host changed (switched on the Hosts
+  // tab), clear and re-subscribe on the new host's connection upon focus.
+  useFocusEffect(
+    useCallback(() => {
+      if (wsClient.activeHostId !== lastHostRef.current) {
+        lastHostRef.current = wsClient.activeHostId;
+        setM(null);
+      }
+      if (wsClient.isConnected) {
+        try {
+          wsClient.send({ ch: Ch.Sys, type: 'subscribe', data: { intervalMs: SUBSCRIBE_INTERVAL_MS } });
+        } catch {
+          /* not connected yet */
+        }
+      }
+    }, []),
+  );
+
   if (!wsClient.isConnected) {
     return (
       <View style={styles.center}>
-        <Text style={styles.notice}>Not paired. Go to the Pair tab first.</Text>
+        <Text style={styles.notice}>No host connected. Go to the Hosts tab and connect.</Text>
       </View>
     );
   }

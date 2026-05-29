@@ -58,6 +58,8 @@ export default function HostsScreen() {
       if (h) {
         setBusy(`Reconnecting to ${h.name}…`);
         wsClient.setTokens(h.access, h.refresh);
+        wsClient.activeHostId = h.id;
+        wsClient.activeHostName = h.name;
         activeIdRef.current = h.id;
         const ok = await wsClient.resume(h.url);
         if (!cancelled && ok) setActiveId(h.id);
@@ -79,6 +81,8 @@ export default function HostsScreen() {
     wsClient.disconnect();
     wsClient.clearTokens();
     wsClient.setTokens(h.access, h.refresh);
+    wsClient.activeHostId = h.id;
+    wsClient.activeHostName = h.name;
     activeIdRef.current = h.id;
     await setActiveHostId(h.id);
     const ok = await wsClient.resume(h.url);
@@ -107,6 +111,8 @@ export default function HostsScreen() {
       };
       await saveHost(host);
       await setActiveHostId(host.id);
+      wsClient.activeHostId = host.id;
+      wsClient.activeHostName = host.name;
       activeIdRef.current = host.id;
       setActiveId(host.id);
       await reloadHosts();
@@ -122,6 +128,8 @@ export default function HostsScreen() {
   const onRemove = useCallback(async (h: Host) => {
     if (h.id === activeIdRef.current) {
       wsClient.disconnect();
+      wsClient.activeHostId = null;
+      wsClient.activeHostName = null;
       setActiveId(null);
     }
     await removeHost(h.id);

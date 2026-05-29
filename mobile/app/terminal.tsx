@@ -13,6 +13,7 @@
  *   RN -> WebView: window.__termWrite(b64)
  */
 
+import { useFocusEffect } from 'expo-router';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   FlatList, StyleSheet, Text, TouchableOpacity, View,
@@ -89,10 +90,27 @@ export default function TerminalScreen() {
   const activeIdRef = useRef<string | null>(null);
   activeIdRef.current = activeId;
   const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 80, rows: 24 });
+  // Host this screen last showed sessions for; used to detect a host switch.
+  const lastHostRef = useRef<string | null>(wsClient.activeHostId);
 
   const refreshList = useCallback(() => {
     if (wsClient.isConnected) wsClient.send({ ch: Ch.Term, type: 'list' });
   }, []);
+
+  // Sessions are per-host. When the tab regains focus, if the active host
+  // changed (user switched on the Hosts tab), drop the old host's session
+  // state and re-list for the new host.
+  useFocusEffect(
+    useCallback(() => {
+      if (wsClient.activeHostId !== lastHostRef.current) {
+        lastHostRef.current = wsClient.activeHostId;
+        setView('list');
+        setActiveId(null);
+        setSessions([]);
+      }
+      refreshList();
+    }, [refreshList]),
+  );
 
   useEffect(() => {
     if (!wsClient.isConnected) return;
@@ -196,7 +214,7 @@ export default function TerminalScreen() {
   if (!wsClient.isConnected) {
     return (
       <View style={styles.center}>
-        <Text style={styles.notice}>Not paired. Go to the Pair tab first.</Text>
+        <Text style={styles.notice}>No host connected. Go to the Hosts tab and connect.</Text>
       </View>
     );
   }
@@ -231,7 +249,12 @@ export default function TerminalScreen() {
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.heading}>Sessions</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.heading}>Sessions</Text>
+          <Text style={styles.hostSub} numberOfLines={1}>
+            {wsClient.activeHostName ?? 'host'}
+          </Text>
+        </View>
         <TouchableOpacity onPress={refreshList}>
           <Text style={styles.headerBtn}>Refresh</Text>
         </TouchableOpacity>
@@ -270,6 +293,7 @@ const styles = StyleSheet.create({
   header:      { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 16, borderBottomWidth: 1, borderBottomColor: '#222' },
   termHeader:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 12, backgroundColor: '#111', borderBottomWidth: 1, borderBottomColor: '#222' },
   heading:     { color: '#e0e0e0', fontSize: 20, fontWeight: '700' },
+  hostSub:     { color: '#4fc3f7', fontSize: 12, fontFamily: 'monospace', marginTop: 2 },
   headerBtn:   { color: '#4fc3f7', fontSize: 15 },
   headerTitle: { color: '#888', fontSize: 13, fontFamily: 'monospace', flex: 1, textAlign: 'center' },
   killBtn:     { color: '#ef5350' },
