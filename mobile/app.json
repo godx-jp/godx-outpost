@@ -4,7 +4,6 @@
     "slug": "remote-host",
     "version": "0.1.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
     "scheme": "remote-host",
     "userInterfaceStyle": "dark",
     "splash": {
@@ -29,8 +28,7 @@
     },
     "web": {
       "bundler": "metro",
-      "output": "static",
-      "favicon": "./assets/favicon.png"
+      "output": "static"
     },
     "plugins": [
       "expo-router",
