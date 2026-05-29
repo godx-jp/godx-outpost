@@ -115,9 +115,9 @@ type refreshClaims struct {
 	jwt.RegisteredClaims
 }
 
-// configDir returns the directory hostd state lives in, creating it 0700.
-// Uses os.UserConfigDir, falling back to ~/.config when that is unavailable.
-func configDir() (string, error) {
+// DefaultConfigDir returns the directory hostd state lives in by default,
+// creating it 0700. Uses os.UserConfigDir, falling back to ~/.config.
+func DefaultConfigDir() (string, error) {
 	base, err := os.UserConfigDir()
 	if err != nil || base == "" {
 		home, herr := os.UserHomeDir()
@@ -126,20 +126,28 @@ func configDir() (string, error) {
 		}
 		base = filepath.Join(home, ".config")
 	}
-	dir := filepath.Join(base, configSubdir)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("auth: create config dir: %w", err)
-	}
-	return dir, nil
+	return filepath.Join(base, configSubdir), nil
 }
 
-// Load returns a Manager backed by ~/.config/hostd, creating the identity on
-// first run and reloading it (never regenerating) on every subsequent call.
-// This idempotence is what lets previously issued tokens survive a reboot.
-func Load() (*Manager, error) {
-	dir, err := configDir()
-	if err != nil {
-		return nil, err
+// Load returns a Manager backed by the default config dir.
+func Load() (*Manager, error) { return LoadFrom("") }
+
+// LoadFrom returns a Manager backed by the given config directory (empty →
+// DefaultConfigDir). Running separate hostd instances with distinct --config-dir
+// values gives each its own identity (deviceID + signing key), i.e. a distinct
+// host from the app's point of view. Identity is created on first run and never
+// regenerated, so issued tokens survive a restart.
+func LoadFrom(configDir string) (*Manager, error) {
+	dir := configDir
+	if dir == "" {
+		d, err := DefaultConfigDir()
+		if err != nil {
+			return nil, err
+		}
+		dir = d
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("auth: create config dir: %w", err)
 	}
 
 	id, err := loadOrCreateIdentity(dir)

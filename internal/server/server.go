@@ -190,8 +190,9 @@ type (
 	}
 
 	pairedResp struct {
-		Access  string `json:"access"`
-		Refresh string `json:"refresh"`
+		Access   string `json:"access"`
+		Refresh  string `json:"refresh"`
+		DeviceID string `json:"deviceId"` // lets the client identify/save this host
 	}
 	okResp struct {
 		DeviceID string `json:"deviceId"`
@@ -223,7 +224,9 @@ func (s *Server) handleCtrl(c *conn, env protocol.Envelope) {
 			return
 		}
 		c.setProfile(prof)
-		s.ctrlReply(c, "paired", env.ID, pairedResp{Access: pair.Access, Refresh: pair.Refresh})
+		s.ctrlReply(c, "paired", env.ID, pairedResp{
+			Access: pair.Access, Refresh: pair.Refresh, DeviceID: s.mgr.DeviceID(),
+		})
 
 	case "auth":
 		var req authReq

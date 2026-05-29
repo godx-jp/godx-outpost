@@ -18,8 +18,8 @@ export default function RootLayout() {
         <Tabs.Screen
           name="index"
           options={{
-            title: "Pair",
-            tabBarLabel: "Pair",
+            title: "Hosts",
+            tabBarLabel: "Hosts",
           }}
         />
         <Tabs.Screen

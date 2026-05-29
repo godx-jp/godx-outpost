@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -44,6 +43,10 @@ import (
 //
 //	-ldflags "-X main.version=v1.2.3"
 var version = "0.1.0-dev"
+
+// flagConfigDir is the --config-dir persistent flag: it selects the identity/
+// token directory. Distinct dirs ⇒ distinct hosts (run several hostd instances).
+var flagConfigDir string
 
 func main() {
 	if err := rootCmd().Execute(); err != nil {
@@ -66,6 +69,8 @@ terminal, file browser, system monitor, and custom API over WebSocket.`,
 		Version:      version, // enables `hostd --version`
 	}
 
+	root.PersistentFlags().StringVar(&flagConfigDir, "config-dir", "",
+		"identity/token directory (default ~/.config/hostd or platform equivalent); use distinct dirs to run multiple independent hosts")
 	root.AddCommand(startCmd(), pairCmd(), statusCmd(), revokeCmd(), versionCmd())
 	return root
 }
@@ -129,7 +134,7 @@ func startCmd() *cobra.Command {
 
 The mobile app scans the QR to pair and receives a long-lived token.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr, err := auth.Load()
+			mgr, err := auth.LoadFrom(flagConfigDir)
 			if err != nil {
 				return fmt.Errorf("load identity: %w", err)
 			}
@@ -184,7 +189,7 @@ func pairCmd() *cobra.Command {
 Use this when you want to pair a new device without restarting the daemon,
 or to inspect the pairing payload for debugging.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr, err := auth.Load()
+			mgr, err := auth.LoadFrom(flagConfigDir)
 			if err != nil {
 				return fmt.Errorf("load identity: %w", err)
 			}
@@ -199,33 +204,20 @@ or to inspect the pairing payload for debugging.`,
 
 // ---- status ------------------------------------------------------------------
 
-// hostdConfigDir resolves the hostd config directory path without loading the
-// full auth manager, mirroring the logic in internal/auth (which does not
-// export a ConfigDir accessor). Mirrors auth.configDir() logic exactly.
-func hostdConfigDir() (string, error) {
-	base, err := os.UserConfigDir()
-	if err != nil || base == "" {
-		home, herr := os.UserHomeDir()
-		if herr != nil {
-			return "", fmt.Errorf("cannot locate config dir: %v", herr)
-		}
-		base = filepath.Join(home, ".config")
-	}
-	return filepath.Join(base, "hostd"), nil
-}
-
 func statusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
 		Short: "Print device ID and config directory path",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr, err := auth.Load()
+			mgr, err := auth.LoadFrom(flagConfigDir)
 			if err != nil {
 				return fmt.Errorf("load identity: %w", err)
 			}
-			dir, err := hostdConfigDir()
-			if err != nil {
-				return err
+			dir := flagConfigDir
+			if dir == "" {
+				if d, derr := auth.DefaultConfigDir(); derr == nil {
+					dir = d
+				}
 			}
 			fmt.Printf("hostd version  : %s\n", version)
 			fmt.Printf("Device ID      : %s\n", mgr.DeviceID())
@@ -253,7 +245,7 @@ func revokeCmd() *cobra.Command {
 After revocation the next client connection must re-pair by scanning a new
 QR code. Use this when a paired device is lost or compromised.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr, err := auth.Load()
+			mgr, err := auth.LoadFrom(flagConfigDir)
 			if err != nil {
 				return fmt.Errorf("load identity: %w", err)
 			}

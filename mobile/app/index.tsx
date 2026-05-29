@@ -1,242 +1,174 @@
 /**
- * Pair screen – two ways to pair with a host:
- *   1. Scan a QR code (expo-camera) that encodes { url, deviceID?, pairingCode }.
- *   2. Enter the host URL + 6-digit pairing code by hand. This is the only
- *      practical path on desktop web (no camera) and a fallback when the QR
- *      can't be scanned.
+ * Hosts screen – manage and connect to multiple paired hosts (Termius-style).
  *
- * Both paths converge on doPair(url, code): connect(url) then pair(code).
+ * - Lists saved hosts; tap one to connect (switches the active connection that
+ *   the Terminal/Files/Monitor tabs use).
+ * - "Add Host" pairs a new host by QR scan (native) or manual URL + 6-digit code.
+ * - Each host keeps its own tokens (lib/hosts.ts); one host is active at a time.
+ * - On launch the last active host is auto-reconnected with its stored token.
  */
 
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
-  Platform,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+  ActivityIndicator, FlatList, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View,
 } from 'react-native';
-import { storageGet, storageSet, wsClient } from '../lib/ws';
+import {
+  defaultHostName, getActiveHostId, listHosts, removeHost, saveHost,
+  setActiveHostId, updateHostTokens, type Host,
+} from '../lib/hosts';
+import { wsClient } from '../lib/ws';
 
-// SecureStore keys may only contain alphanumerics, ".", "-", "_" (no ":").
-const STORAGE_KEY = 'remote_host_last_pair';
 const DEFAULT_URL = 'ws://127.0.0.1:8722';
 
-interface QRPayload {
-  url: string;
-  pairingCode: string;
-}
+type Phase = 'loading' | 'hosts' | 'add' | 'scan';
 
-type Status =
-  | 'resuming'
-  | 'idle'
-  | 'manual'
-  | 'scanning'
-  | 'connecting'
-  | 'pairing'
-  | 'paired'
-  | 'error';
-
-export default function PairScreen() {
+export default function HostsScreen() {
   const [permission, requestPermission] = useCameraPermissions();
-  // Start in 'resuming' while we check for a saved session.
-  const [status, setStatus] = useState<Status>('resuming');
-  const [errorMsg, setErrorMsg] = useState('');
-  const [manualUrl, setManualUrl] = useState(DEFAULT_URL);
+  const [phase, setPhase]       = useState<Phase>('loading');
+  const [hosts, setHosts]       = useState<Host[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [busy, setBusy]         = useState('');
+  const [error, setError]       = useState('');
+  const [manualUrl, setManualUrl]   = useState(DEFAULT_URL);
   const [manualCode, setManualCode] = useState('');
+
+  const activeIdRef = useRef<string | null>(null);
+  activeIdRef.current = activeId;
   const scannedRef = useRef(false);
 
-  // On mount: if we paired before, reconnect with the stored token and skip
-  // straight to "paired" — no QR/code needed (this is the "remember me" path).
+  const reloadHosts = useCallback(async () => {
+    setHosts(await listHosts());
+  }, []);
+
+  // Mount: persist refreshed tokens to the right host, then auto-reconnect.
   useEffect(() => {
+    wsClient.onTokens = (access, refresh) => {
+      const id = activeIdRef.current;
+      if (id) void updateHostTokens(id, access, refresh);
+    };
+
     let cancelled = false;
     (async () => {
-      const raw = await storageGet(STORAGE_KEY);
-      if (!raw) {
-        if (!cancelled) setStatus('idle');
-        return;
+      const hs = await listHosts();
+      if (cancelled) return;
+      setHosts(hs);
+      const aid = await getActiveHostId();
+      const h = aid ? hs.find((x) => x.id === aid) : undefined;
+      if (h) {
+        setBusy(`Reconnecting to ${h.name}…`);
+        wsClient.setTokens(h.access, h.refresh);
+        activeIdRef.current = h.id;
+        const ok = await wsClient.resume(h.url);
+        if (!cancelled && ok) setActiveId(h.id);
       }
-      let url = DEFAULT_URL;
-      try {
-        url = (JSON.parse(raw) as { url: string }).url || DEFAULT_URL;
-      } catch {
-        /* ignore malformed */
-      }
-      if (!cancelled) setManualUrl(url);
-      const ok = await wsClient.resume(url);
-      if (!cancelled) setStatus(ok ? 'paired' : 'idle');
+      if (!cancelled) { setBusy(''); setPhase('hosts'); }
     })();
+
     return () => {
       cancelled = true;
+      wsClient.onTokens = null;
     };
   }, []);
 
-  // Shared pairing flow used by both QR scan and manual entry.
-  const doPair = useCallback(async (url: string, code: string) => {
-    try {
-      setStatus('connecting');
-      await wsClient.connect(url);
-
-      setStatus('pairing');
-      await wsClient.pair(code);
-
-      // Remember the host so next launch can auto-resume with the stored token.
-      // storageSet is best-effort and never throws.
-      await storageSet(STORAGE_KEY, JSON.stringify({ url }));
-      setStatus('paired');
-    } catch (e) {
-      setErrorMsg((e as Error).message ?? 'Pairing failed');
-      setStatus('error');
-      scannedRef.current = false;
+  // Connect (or switch) to a saved host.
+  const connectHost = useCallback(async (h: Host) => {
+    if (h.id === activeIdRef.current && wsClient.isAuthed) return;
+    setError('');
+    setBusy(`Connecting to ${h.name}…`);
+    wsClient.disconnect();
+    wsClient.clearTokens();
+    wsClient.setTokens(h.access, h.refresh);
+    activeIdRef.current = h.id;
+    await setActiveHostId(h.id);
+    const ok = await wsClient.resume(h.url);
+    if (ok) {
+      setActiveId(h.id);
+    } else {
+      setActiveId(null);
+      setError(`Could not authenticate with ${h.name}. It may have been revoked — remove and re-pair.`);
     }
+    setBusy('');
   }, []);
 
-  const handleBarcode = useCallback(
-    async ({ data }: { data: string }) => {
-      if (scannedRef.current) return;
-      scannedRef.current = true;
-
-      let payload: QRPayload;
-      try {
-        payload = JSON.parse(data) as QRPayload;
-        if (!payload.url || !payload.pairingCode) {
-          throw new Error('Invalid QR payload – missing url or pairingCode.');
-        }
-      } catch (e) {
-        setErrorMsg((e as Error).message);
-        setStatus('error');
-        scannedRef.current = false;
-        return;
-      }
-      await doPair(payload.url, payload.pairingCode);
-    },
-    [doPair],
-  );
-
-  const submitManual = useCallback(() => {
-    const url = manualUrl.trim();
-    const code = manualCode.trim();
-    if (!url || !code) {
-      setErrorMsg('Enter both the host URL and the pairing code.');
-      setStatus('error');
-      return;
+  // Pair a brand-new host and save it.
+  const doAddPair = useCallback(async (url: string, code: string) => {
+    setError('');
+    try {
+      setBusy('Connecting…');
+      wsClient.disconnect();
+      wsClient.clearTokens();
+      await wsClient.connect(url);
+      setBusy('Pairing…');
+      const r = await wsClient.pair(code);
+      const host: Host = {
+        id: r.deviceId, name: defaultHostName(url), url,
+        access: r.access, refresh: r.refresh,
+      };
+      await saveHost(host);
+      await setActiveHostId(host.id);
+      activeIdRef.current = host.id;
+      setActiveId(host.id);
+      await reloadHosts();
+      setManualCode('');
+      setBusy('');
+      setPhase('hosts');
+    } catch (e) {
+      setBusy('');
+      setError((e as Error).message ?? 'Pairing failed');
     }
-    void doPair(url, code);
-  }, [manualUrl, manualCode, doPair]);
+  }, [reloadHosts]);
 
-  const reset = () => {
-    scannedRef.current = false;
-    setStatus('idle');
-    setErrorMsg('');
-  };
+  const onRemove = useCallback(async (h: Host) => {
+    if (h.id === activeIdRef.current) {
+      wsClient.disconnect();
+      setActiveId(null);
+    }
+    await removeHost(h.id);
+    await reloadHosts();
+  }, [reloadHosts]);
 
-  // ── Resuming: checking for a saved session
-  if (status === 'resuming') {
+  const handleBarcode = useCallback(({ data }: { data: string }) => {
+    if (scannedRef.current) return;
+    scannedRef.current = true;
+    try {
+      const p = JSON.parse(data) as { url: string; pairingCode: string };
+      if (!p.url || !p.pairingCode) throw new Error('Invalid QR payload.');
+      setPhase('add');
+      void doAddPair(p.url, p.pairingCode);
+    } catch (e) {
+      setError((e as Error).message);
+      setPhase('add');
+    } finally {
+      scannedRef.current = false;
+    }
+  }, [doAddPair]);
+
+  // ── Loading / busy ──────────────────────────────────────────────────────────
+  if (phase === 'loading' || busy) {
     return (
       <View style={styles.center}>
         <ActivityIndicator size="large" color="#4fc3f7" />
-        <Text style={[styles.label, { marginTop: 16 }]}>Restoring session…</Text>
+        {busy ? <Text style={[styles.sub, { marginTop: 16 }]}>{busy}</Text> : null}
       </View>
     );
   }
 
-  // ── Idle: choose how to pair
-  if (status === 'idle') {
-    return (
-      <View style={styles.center}>
-        <Text style={styles.heading}>Connect to a Host</Text>
-        <Text style={styles.label}>
-          Run <Text style={styles.mono}>hostd start</Text> on your machine, then scan the QR
-          code — or enter the host URL and 6-digit code shown in the terminal.
-        </Text>
-        {/* QR scanning needs a camera; hidden on web where it isn't available. */}
-        {Platform.OS !== 'web' && (
-          <TouchableOpacity style={styles.button} onPress={() => setStatus('scanning')}>
-            <Text style={styles.buttonText}>Scan QR Code</Text>
+  // ── QR scanning ───────────────────────────────────────────────────────────
+  if (phase === 'scan') {
+    if (!permission?.granted) {
+      return (
+        <View style={styles.center}>
+          <Text style={styles.sub}>Camera access is required to scan a QR code.</Text>
+          <TouchableOpacity style={styles.btn} onPress={requestPermission}>
+            <Text style={styles.btnText}>Grant Permission</Text>
           </TouchableOpacity>
-        )}
-        <TouchableOpacity
-          style={[styles.button, styles.secondaryButton]}
-          onPress={() => {
-            setErrorMsg('');
-            setStatus('manual');
-          }}
-        >
-          <Text style={[styles.buttonText, styles.secondaryButtonText]}>Enter Code Manually</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
-
-  // ── Manual entry
-  if (status === 'manual') {
-    return (
-      <View style={styles.center}>
-        <Text style={styles.heading}>Enter Pairing Details</Text>
-        <Text style={styles.fieldLabel}>Host URL</Text>
-        <TextInput
-          style={styles.input}
-          value={manualUrl}
-          onChangeText={setManualUrl}
-          autoCapitalize="none"
-          autoCorrect={false}
-          placeholder="ws://127.0.0.1:8722"
-          placeholderTextColor="#666"
-          keyboardType="url"
-        />
-        <Text style={styles.fieldLabel}>Pairing Code</Text>
-        <TextInput
-          style={[styles.input, styles.codeInput]}
-          value={manualCode}
-          onChangeText={setManualCode}
-          autoCapitalize="none"
-          autoCorrect={false}
-          placeholder="123456"
-          placeholderTextColor="#666"
-          keyboardType="number-pad"
-          maxLength={8}
-          onSubmitEditing={submitManual}
-          returnKeyType="go"
-        />
-        <TouchableOpacity style={styles.button} onPress={submitManual}>
-          <Text style={styles.buttonText}>Pair</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.linkButton} onPress={reset}>
-          <Text style={styles.linkText}>Back</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
-
-  // ── Permission not yet resolved (native only)
-  if (!permission) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" color="#4fc3f7" />
-      </View>
-    );
-  }
-
-  // ── Permission denied
-  if (status === 'scanning' && !permission.granted) {
-    return (
-      <View style={styles.center}>
-        <Text style={styles.label}>Camera access is required to scan a QR code.</Text>
-        <TouchableOpacity style={styles.button} onPress={requestPermission}>
-          <Text style={styles.buttonText}>Grant Permission</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.linkButton} onPress={reset}>
-          <Text style={styles.linkText}>Enter code manually instead</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
-
-  // ── Scanning
-  if (status === 'scanning') {
+          <TouchableOpacity style={styles.link} onPress={() => setPhase('add')}>
+            <Text style={styles.linkText}>Enter manually instead</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
     return (
       <View style={styles.full}>
         <CameraView
@@ -245,127 +177,123 @@ export default function PairScreen() {
           onBarcodeScanned={handleBarcode}
           barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
         />
-        <View style={styles.overlay}>
-          <Text style={styles.overlayText}>Align the QR code within the frame</Text>
-        </View>
-        <TouchableOpacity style={styles.cancelButton} onPress={() => setStatus('idle')}>
-          <Text style={styles.buttonText}>Cancel</Text>
+        <TouchableOpacity style={styles.cancel} onPress={() => setPhase('add')}>
+          <Text style={styles.btnText}>Cancel</Text>
         </TouchableOpacity>
       </View>
     );
   }
 
-  // ── In-progress states
-  if (status === 'connecting' || status === 'pairing') {
+  // ── Add a new host ──────────────────────────────────────────────────────────
+  if (phase === 'add') {
     return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" color="#4fc3f7" />
-        <Text style={styles.label}>{status === 'connecting' ? 'Connecting…' : 'Pairing…'}</Text>
-      </View>
-    );
-  }
+      <View style={styles.containerPad}>
+        <Text style={styles.heading}>Add a Host</Text>
+        <Text style={styles.sub}>
+          Run <Text style={styles.mono}>hostd start</Text> and enter its URL + 6-digit code,
+          {Platform.OS !== 'web' ? ' or scan the QR.' : ''}
+        </Text>
+        {error ? <Text style={styles.error}>{error}</Text> : null}
 
-  // ── Success
-  if (status === 'paired') {
-    return (
-      <View style={styles.center}>
-        <Text style={styles.heading}>Paired!</Text>
-        <Text style={styles.label}>Connected. Switch to Terminal, Files, or Monitor tabs.</Text>
-        <TouchableOpacity style={styles.button} onPress={reset}>
-          <Text style={styles.buttonText}>Pair a Different Host</Text>
+        <Text style={styles.fieldLabel}>Host URL</Text>
+        <TextInput
+          style={styles.input} value={manualUrl} onChangeText={setManualUrl}
+          autoCapitalize="none" autoCorrect={false} placeholder={DEFAULT_URL} placeholderTextColor="#666"
+          keyboardType="url"
+        />
+        <Text style={styles.fieldLabel}>Pairing Code</Text>
+        <TextInput
+          style={[styles.input, styles.code]} value={manualCode} onChangeText={setManualCode}
+          autoCapitalize="none" autoCorrect={false} placeholder="123456" placeholderTextColor="#666"
+          keyboardType="number-pad" maxLength={8}
+          onSubmitEditing={() => doAddPair(manualUrl.trim(), manualCode.trim())} returnKeyType="go"
+        />
+        <TouchableOpacity style={styles.btn} onPress={() => doAddPair(manualUrl.trim(), manualCode.trim())}>
+          <Text style={styles.btnText}>Pair</Text>
+        </TouchableOpacity>
+        {Platform.OS !== 'web' ? (
+          <TouchableOpacity
+            style={[styles.btn, styles.outline]}
+            onPress={() => { setError(''); setPhase('scan'); }}
+          >
+            <Text style={[styles.btnText, styles.outlineText]}>Scan QR Code</Text>
+          </TouchableOpacity>
+        ) : null}
+        <TouchableOpacity style={styles.link} onPress={() => { setError(''); setPhase('hosts'); }}>
+          <Text style={styles.linkText}>Back to hosts</Text>
         </TouchableOpacity>
       </View>
     );
   }
 
-  // ── Error
+  // ── Hosts list ───────────────────────────────────────────────────────────────
   return (
-    <View style={styles.center}>
-      <Text style={[styles.heading, { color: '#ef5350' }]}>Pairing Failed</Text>
-      <Text style={styles.label}>{errorMsg}</Text>
-      <TouchableOpacity style={styles.button} onPress={() => setStatus('manual')}>
-        <Text style={styles.buttonText}>Try Again</Text>
-      </TouchableOpacity>
-      <TouchableOpacity style={styles.linkButton} onPress={reset}>
-        <Text style={styles.linkText}>Start over</Text>
-      </TouchableOpacity>
+    <View style={styles.container}>
+      <View style={styles.header}>
+        <Text style={styles.heading}>Hosts</Text>
+        <TouchableOpacity onPress={() => { setError(''); setPhase('add'); }}>
+          <Text style={styles.headerBtn}>+ Add</Text>
+        </TouchableOpacity>
+      </View>
+      {error ? <Text style={styles.error}>{error}</Text> : null}
+
+      <FlatList
+        data={hosts}
+        keyExtractor={(h) => h.id}
+        ListEmptyComponent={
+          <Text style={styles.empty}>No hosts yet. Tap “+ Add” to pair your first host.</Text>
+        }
+        renderItem={({ item }) => {
+          const connected = item.id === activeId && wsClient.isAuthed;
+          return (
+            <TouchableOpacity style={styles.row} onPress={() => connectHost(item)}>
+              <View style={[styles.dot, connected ? styles.dotOn : styles.dotOff]} />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.rowName}>{item.name}</Text>
+                <Text style={styles.rowSub} numberOfLines={1}>
+                  {item.url}{connected ? ' · connected' : ''}
+                </Text>
+              </View>
+              <TouchableOpacity onPress={() => onRemove(item)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                <Text style={styles.remove}>Remove</Text>
+              </TouchableOpacity>
+            </TouchableOpacity>
+          );
+        }}
+        ItemSeparatorComponent={() => <View style={styles.sep} />}
+      />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  full: { flex: 1, backgroundColor: '#000' },
-  center: {
-    flex: 1,
-    backgroundColor: '#0d0d0d',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 24,
-  },
-  heading: {
-    fontSize: 24,
-    fontWeight: '700',
-    color: '#e0e0e0',
-    marginBottom: 12,
-    textAlign: 'center',
-  },
-  label: {
-    fontSize: 15,
-    color: '#aaaaaa',
-    textAlign: 'center',
-    marginBottom: 24,
-    lineHeight: 22,
-  },
-  mono: { fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', color: '#4fc3f7' },
-  fieldLabel: {
-    alignSelf: 'stretch',
-    fontSize: 13,
-    color: '#888',
-    marginBottom: 6,
-    marginTop: 8,
-  },
-  input: {
-    alignSelf: 'stretch',
-    backgroundColor: '#1a1a1a',
-    borderColor: '#333',
-    borderWidth: 1,
-    borderRadius: 8,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    color: '#e0e0e0',
-    fontSize: 16,
-    marginBottom: 8,
-  },
-  codeInput: { letterSpacing: 4, fontSize: 22, textAlign: 'center' },
-  button: {
-    backgroundColor: '#4fc3f7',
-    paddingHorizontal: 28,
-    paddingVertical: 12,
-    borderRadius: 8,
-    marginTop: 12,
-    alignSelf: 'stretch',
-    alignItems: 'center',
-  },
-  secondaryButton: { backgroundColor: 'transparent', borderColor: '#4fc3f7', borderWidth: 1 },
-  secondaryButtonText: { color: '#4fc3f7' },
-  cancelButton: {
-    position: 'absolute',
-    bottom: 40,
-    alignSelf: 'center',
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    paddingHorizontal: 28,
-    paddingVertical: 12,
-    borderRadius: 8,
-  },
-  buttonText: { color: '#0d0d0d', fontWeight: '700', fontSize: 16 },
-  linkButton: { marginTop: 16, padding: 8 },
-  linkText: { color: '#4fc3f7', fontSize: 14 },
-  overlay: { position: 'absolute', top: 60, left: 0, right: 0, alignItems: 'center' },
-  overlayText: {
-    color: '#ffffff',
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    padding: 8,
-    borderRadius: 6,
-    fontSize: 14,
-  },
+  full:         { flex: 1, backgroundColor: '#000' },
+  container:    { flex: 1, backgroundColor: '#0d0d0d' },
+  containerPad: { flex: 1, backgroundColor: '#0d0d0d', padding: 24, justifyContent: 'center' },
+  center:       { flex: 1, backgroundColor: '#0d0d0d', alignItems: 'center', justifyContent: 'center', padding: 24 },
+  heading:      { color: '#e0e0e0', fontSize: 24, fontWeight: '700' },
+  sub:          { color: '#aaa', fontSize: 15, textAlign: 'center', lineHeight: 22, marginTop: 8 },
+  mono:         { fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', color: '#4fc3f7' },
+  error:        { color: '#ef5350', fontSize: 13, marginVertical: 10 },
+  header:       { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 16, borderBottomWidth: 1, borderBottomColor: '#222' },
+  headerBtn:    { color: '#4fc3f7', fontSize: 16, fontWeight: '600' },
+  empty:        { color: '#555', textAlign: 'center', marginTop: 40, fontSize: 14, paddingHorizontal: 24 },
+  row:          { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 16 },
+  dot:          { width: 10, height: 10, borderRadius: 5, marginRight: 12 },
+  dotOn:        { backgroundColor: '#4caf50' },
+  dotOff:       { backgroundColor: '#444' },
+  rowName:      { color: '#e0e0e0', fontSize: 16 },
+  rowSub:       { color: '#666', fontSize: 12, fontFamily: 'monospace', marginTop: 2 },
+  remove:       { color: '#ef5350', fontSize: 13 },
+  sep:          { height: 1, backgroundColor: '#1a1a1a', marginLeft: 38 },
+  fieldLabel:   { alignSelf: 'stretch', color: '#888', fontSize: 13, marginTop: 14, marginBottom: 6 },
+  input:        { alignSelf: 'stretch', backgroundColor: '#1a1a1a', borderColor: '#333', borderWidth: 1, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 12, color: '#e0e0e0', fontSize: 16 },
+  code:         { letterSpacing: 4, fontSize: 22, textAlign: 'center' },
+  btn:          { backgroundColor: '#4fc3f7', paddingVertical: 13, borderRadius: 8, marginTop: 16, alignSelf: 'stretch', alignItems: 'center' },
+  outline:      { backgroundColor: 'transparent', borderColor: '#4fc3f7', borderWidth: 1 },
+  outlineText:  { color: '#4fc3f7' },
+  btnText:      { color: '#0d0d0d', fontWeight: '700', fontSize: 16 },
+  link:         { marginTop: 16, padding: 8, alignSelf: 'center' },
+  linkText:     { color: '#4fc3f7', fontSize: 14 },
+  cancel:       { position: 'absolute', bottom: 40, alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 28, paddingVertical: 12, borderRadius: 8 },
 });

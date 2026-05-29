@@ -88,48 +88,10 @@ export async function storageSet(key: string, value: string): Promise<void> {
   }
 }
 
-const TOKEN_KEY_ACCESS  = 'rh_access_token';
-const TOKEN_KEY_REFRESH = 'rh_refresh_token';
-
-// Token persistence is best-effort: expo-secure-store is unavailable on web,
-// so all access is guarded. A failure to persist must not break pairing — it
-// just means the session isn't remembered across reloads.
-async function loadTokens(): Promise<{ access: string | null; refresh: string | null }> {
-  try {
-    const store = await secureStore();
-    const [access, refresh] = await Promise.all([
-      store.getItemAsync(TOKEN_KEY_ACCESS),
-      store.getItemAsync(TOKEN_KEY_REFRESH),
-    ]);
-    return { access, refresh };
-  } catch {
-    return { access: null, refresh: null };
-  }
-}
-
-async function saveTokens(access: string, refresh: string): Promise<void> {
-  try {
-    const store = await secureStore();
-    await Promise.all([
-      store.setItemAsync(TOKEN_KEY_ACCESS, access),
-      store.setItemAsync(TOKEN_KEY_REFRESH, refresh),
-    ]);
-  } catch {
-    /* web / no secure store — session not persisted */
-  }
-}
-
-async function clearTokens(): Promise<void> {
-  try {
-    const store = await secureStore();
-    await Promise.all([
-      store.deleteItemAsync(TOKEN_KEY_ACCESS),
-      store.deleteItemAsync(TOKEN_KEY_REFRESH),
-    ]);
-  } catch {
-    /* ignore */
-  }
-}
+// Tokens are NOT persisted globally here — the app supports multiple hosts, so
+// each host's tokens are stored per-host by lib/hosts.ts. The Client holds the
+// *active* host's tokens in memory and reports changes via onTokens so the
+// caller can persist them against the right host.
 
 // ---------------------------------------------------------------------------
 // Back-off
@@ -185,7 +147,7 @@ export type ClientStatus =
 // NOTE: these field names mirror the Go server's ctrl payloads exactly
 // (internal/server/server.go). Do not rename without changing the server.
 interface PairRequest     { code: string }
-interface PairResponse    { access: string; refresh: string }   // ctrl "paired"
+interface PairResponse    { access: string; refresh: string; deviceId: string } // ctrl "paired"
 interface AuthRequest     { access: string }
 interface AuthResponse    { deviceId: string }                  // ctrl "ok"
 interface RefreshRequest  { refresh: string }
@@ -200,6 +162,14 @@ export class Client {
   onEnvelope: EnvelopeCallback | null = null;
   onBinary:   BinaryCallback   | null = null;
   onStatus:   StatusCallback   | null = null;
+  /** Fired whenever the active host's tokens change (pair/refresh), so the
+   *  caller can persist them against the right host. */
+  onTokens: ((access: string, refresh: string) => void) | null = null;
+
+  // Active host's credentials, held in memory (persistence is per-host, in
+  // lib/hosts.ts). Seed via setTokens() before connect()/resume().
+  private _access:  string | null = null;
+  private _refresh: string | null = null;
 
   private url:    string | null = null;
   private ws:     WebSocket | null = null;
@@ -234,15 +204,26 @@ export class Client {
     return this._openAndAuth();
   }
 
+  /** Seed the active host's tokens (from the host registry) before connecting. */
+  setTokens(access: string | null, refresh: string | null): void {
+    this._access = access;
+    this._refresh = refresh;
+  }
+
+  /** Clear in-memory tokens (e.g. when switching hosts or on hard auth failure). */
+  clearTokens(): void {
+    this._access = null;
+    this._refresh = null;
+    this._authed = false;
+  }
+
   /**
-   * Resume a previously paired session: connect to url and authenticate using
-   * the stored access/refresh token. Returns true if we ended up authenticated
-   * (i.e. the host still trusts our token), false if there was no usable token
-   * (caller should show the pairing UI). Never throws on a missing token.
+   * Resume a session: connect to url and authenticate with the in-memory
+   * access/refresh tokens (seed them via setTokens first). Returns true if we
+   * ended up authenticated, false if there was no usable token. Never throws.
    */
   async resume(url: string): Promise<boolean> {
-    const { access, refresh } = await loadTokens();
-    if (!access && !refresh) return false;
+    if (!this._access && !this._refresh) return false;
     try {
       await this.connect(url);
       return this._authed;
@@ -262,15 +243,19 @@ export class Client {
   }
 
   /**
-   * Pair with a new host using a one-time pairing code.
-   * Persists the returned tokens in secure-store.
+   * Pair with a new host using a one-time pairing code. Sets the active
+   * credentials in memory, reports them via onTokens, and returns the server's
+   * deviceId so the caller can save this host. The socket is authenticated.
    */
-  async pair(code: string): Promise<void> {
+  async pair(code: string): Promise<{ access: string; refresh: string; deviceId: string }> {
     const res = await this._request<PairRequest, PairResponse>(
       Ch.Ctrl, 'pair', { code },
     );
-    await saveTokens(res.access, res.refresh);
+    this._access = res.access;
+    this._refresh = res.refresh;
     this._authed = true;
+    this.onTokens?.(res.access, res.refresh);
+    return res;
   }
 
   /**
@@ -292,8 +277,10 @@ export class Client {
       Ch.Ctrl, 'refresh', { refresh: refreshToken },
     );
     // The server's "refresh" returns only a new access token; the refresh
-    // token is unchanged, so persist the new access alongside the same refresh.
-    await saveTokens(res.access, refreshToken);
+    // token is unchanged. Update memory and report so the caller re-persists.
+    this._access = res.access;
+    this._refresh = refreshToken;
+    this.onTokens?.(res.access, refreshToken);
   }
 
   /**
@@ -328,7 +315,8 @@ export class Client {
     await this._openSocket();
 
     this._setStatus('authenticating');
-    const { access, refresh } = await loadTokens();
+    const access = this._access;
+    const refresh = this._refresh;
 
     if (access) {
       try {
@@ -336,11 +324,11 @@ export class Client {
         this._authed = true;
       } catch {
         if (refresh) {
-          // refresh() saves the new tokens and the server considers us authed.
+          // refresh() updates the in-memory access token; server now trusts us.
           await this.refresh(refresh);
           this._authed = true;
         } else {
-          await clearTokens();
+          this.clearTokens();
           throw new Error('ws: auth failed and no refresh token available');
         }
       }
