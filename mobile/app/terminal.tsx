@@ -1,35 +1,35 @@
 /**
- * Terminal screen – embeds xterm.js in a WebView.
+ * Terminal screen – tmux-like multiple persistent sessions.
  *
- * Bridge protocol (postMessage both ways):
- *   WebView -> RN:  { type: "term/input",  data: <base64 binary> }
- *                   { type: "term/resize", cols: number, rows: number }
- *   RN -> WebView:  { type: "term/output", data: <base64 binary> }
+ * Two views:
+ *   - "list": shows sessions from the host (term/list); create, attach, or kill.
+ *   - "term": an xterm.js WebView attached to one session.
  *
- * RN bridges to wsClient:
- *   user input -> wsClient.sendBinary({ kind: BinaryKind.TermInput, streamID, payload })
- *   output     <- wsClient.onBinary  ({ kind: BinaryKind.TermOutput, streamID, payload })
- *   resize     -> wsClient.send({ ch: Ch.Term, type: 'resize', data: { cols, rows } })
- *   open       -> wsClient.send({ ch: Ch.Term, type: 'open' })
- *   close      -> wsClient.send({ ch: Ch.Term, type: 'close' })
+ * Sessions live on the host independent of this connection, so attaching
+ * replays recent output (scrollback) and detaching/leaving keeps them running.
+ *
+ * Bridge (postMessage):
+ *   WebView -> RN: { type:'ready' } | { type:'term/input', data:b64 } | { type:'term/resize', cols, rows }
+ *   RN -> WebView: window.__termWrite(b64)
  */
 
-import React, { useEffect, useRef } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  FlatList, StyleSheet, Text, TouchableOpacity, View,
+} from 'react-native';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
-import { BinaryKind, Ch } from '../lib/protocol';
+import { BinaryKind, Ch, type Envelope } from '../lib/protocol';
 import { wsClient } from '../lib/ws';
 
-// Session ID for this terminal (a real app would get this from the server open response).
-const SESSION_ID = 'default';
+interface SessionInfo {
+  id: string; title: string; cols: number; rows: number; alive: boolean; created: number;
+}
 
-// Inline HTML that loads xterm.js from CDN and wires up postMessage bridging.
 const TERMINAL_HTML = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
-  <title>Terminal</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
   <style>
     html, body { margin: 0; padding: 0; background: #0d0d0d; height: 100%; overflow: hidden; }
@@ -44,113 +44,147 @@ const TERMINAL_HTML = `<!DOCTYPE html>
     const term = new Terminal({
       theme: { background: '#0d0d0d', foreground: '#e0e0e0', cursor: '#4fc3f7' },
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
-      fontSize: 14,
-      cursorBlink: true,
+      fontSize: 14, cursorBlink: true,
     });
-
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
     term.open(document.getElementById('terminal'));
     fitAddon.fit();
 
-    function postResize() {
-      window.ReactNativeWebView.postMessage(JSON.stringify({
-        type: 'term/resize', cols: term.cols, rows: term.rows,
-      }));
-    }
-    postResize();
+    function post(obj) { window.ReactNativeWebView.postMessage(JSON.stringify(obj)); }
+    function postResize() { post({ type: 'term/resize', cols: term.cols, rows: term.rows }); }
 
     window.addEventListener('resize', () => { fitAddon.fit(); postResize(); });
 
-    // User typed -> forward to RN as base64
     term.onData((data) => {
       const bytes = new TextEncoder().encode(data);
       let bin = '';
       bytes.forEach(b => bin += String.fromCharCode(b));
-      window.ReactNativeWebView.postMessage(JSON.stringify({
-        type: 'term/input', data: btoa(bin),
-      }));
+      post({ type: 'term/input', data: btoa(bin) });
     });
 
-    // RN -> WebView: render base64-encoded output bytes. RN calls this
-    // directly via injectJavaScript (simpler and safer than dispatching a
-    // synthetic MessageEvent).
+    // RN -> WebView: write base64 output bytes.
     window.__termWrite = function (b64) {
       try {
-        const bin   = atob(b64);
+        const bin = atob(b64);
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         term.write(bytes);
-      } catch (_) { /* ignore */ }
+      } catch (_) {}
     };
 
-    term.writeln('\\x1b[1;34mremote-host\\x1b[0m – waiting for connection…');
+    // Tell RN we're ready so it can attach (and the initial size).
+    postResize();
+    post({ type: 'ready' });
   </script>
 </body>
 </html>`;
 
 export default function TerminalScreen() {
+  const [view, setView]         = useState<'list' | 'term'>('list');
+  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+
   const webviewRef = useRef<WebView>(null);
+  const activeIdRef = useRef<string | null>(null);
+  activeIdRef.current = activeId;
+  const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 80, rows: 24 });
+
+  const refreshList = useCallback(() => {
+    if (wsClient.isConnected) wsClient.send({ ch: Ch.Term, type: 'list' });
+  }, []);
 
   useEffect(() => {
     if (!wsClient.isConnected) return;
 
-    // Open a PTY session on the host. The server keys sessions by "sessionId";
-    // cols/rows are seeded here and refined by the WebView's resize message.
-    wsClient.send({
-      ch: Ch.Term,
-      type: 'open',
-      data: { sessionId: SESSION_ID, cols: 80, rows: 24 },
-    });
+    const prevEnv = wsClient.onEnvelope;
+    wsClient.onEnvelope = (env: Envelope) => {
+      prevEnv?.(env);
+      if (env.ch !== Ch.Term) return;
+      const d = (env.data ?? {}) as any;
+      switch (env.type) {
+        case 'list':
+          setSessions((d.sessions ?? []) as SessionInfo[]);
+          break;
+        case 'created':
+          // New session created on host → open it.
+          setActiveId(d.sessionId);
+          setView('term');
+          break;
+        case 'killed':
+        case 'exit':
+          if (activeIdRef.current === d.sessionId) {
+            setActiveId(null);
+            setView('list');
+          }
+          refreshList();
+          break;
+      }
+    };
 
-    // Route binary output from host to the WebView
-    const prevOnBinary = wsClient.onBinary;
+    const prevBin = wsClient.onBinary;
     wsClient.onBinary = (frame) => {
-      prevOnBinary?.(frame);
-      if (frame.kind !== BinaryKind.TermOutput || frame.streamID !== SESSION_ID) return;
-
+      prevBin?.(frame);
+      if (frame.kind !== BinaryKind.TermOutput) return;
+      if (frame.streamID !== activeIdRef.current) return;
       let bin = '';
       frame.payload.forEach((b) => (bin += String.fromCharCode(b)));
       const b64 = btoa(bin);
-
-      // Call the WebView's write function directly. JSON.stringify produces a
-      // safely-quoted JS string literal; trailing `true;` keeps WKWebView happy.
-      webviewRef.current?.injectJavaScript(
-        `window.__termWrite(${JSON.stringify(b64)});true;`
-      );
+      webviewRef.current?.injectJavaScript(`window.__termWrite(${JSON.stringify(b64)});true;`);
     };
+
+    refreshList();
 
     return () => {
-      wsClient.onBinary = prevOnBinary;
-      wsClient.send({ ch: Ch.Term, type: 'close', data: { sessionId: SESSION_ID } });
+      wsClient.onEnvelope = prevEnv;
+      wsClient.onBinary = prevBin;
     };
-  }, []);
+  }, [refreshList]);
+
+  const createSession = () => {
+    wsClient.send({ ch: Ch.Term, type: 'create', data: { cols: 80, rows: 24 } });
+    // activeId/view set when "created" arrives.
+  };
+
+  const openSession = (id: string) => {
+    setActiveId(id);
+    setView('term');
+    // attach is sent once the WebView signals 'ready'.
+  };
+
+  const killSession = (id: string) => {
+    wsClient.send({ ch: Ch.Term, type: 'kill', data: { sessionId: id } });
+  };
+
+  const leaveToList = () => {
+    if (activeIdRef.current) {
+      wsClient.send({ ch: Ch.Term, type: 'detach', data: { sessionId: activeIdRef.current } });
+    }
+    setActiveId(null);
+    setView('list');
+    refreshList();
+  };
 
   const handleWebViewMessage = (event: WebViewMessageEvent) => {
-    try {
-      const msg = JSON.parse(event.nativeEvent.data) as {
-        type: string;
-        data?: string;
-        cols?: number;
-        rows?: number;
-      };
+    let msg: { type: string; data?: string; cols?: number; rows?: number };
+    try { msg = JSON.parse(event.nativeEvent.data); } catch { return; }
+    const id = activeIdRef.current;
+    if (!id) return;
 
-      if (msg.type === 'term/input' && msg.data) {
-        const bin   = atob(msg.data);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        wsClient.sendBinary({ kind: BinaryKind.TermInput, streamID: SESSION_ID, payload: bytes });
-      }
-
-      if (msg.type === 'term/resize') {
-        wsClient.send({
-          ch:   Ch.Term,
-          type: 'resize',
-          data: { sessionId: SESSION_ID, cols: msg.cols, rows: msg.rows },
-        });
-      }
-    } catch {
-      // ignore malformed messages
+    if (msg.type === 'ready') {
+      // Attach now that xterm exists; scrollback replays into it.
+      wsClient.send({
+        ch: Ch.Term, type: 'attach',
+        data: { sessionId: id, cols: lastSizeRef.current.cols, rows: lastSizeRef.current.rows },
+      });
+    } else if (msg.type === 'term/input' && msg.data) {
+      const bin = atob(msg.data);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      wsClient.sendBinary({ kind: BinaryKind.TermInput, streamID: id, payload: bytes });
+    } else if (msg.type === 'term/resize' && msg.cols && msg.rows) {
+      lastSizeRef.current = { cols: msg.cols, rows: msg.rows };
+      wsClient.send({ ch: Ch.Term, type: 'resize', data: { sessionId: id, cols: msg.cols, rows: msg.rows } });
     }
   };
 
@@ -162,30 +196,83 @@ export default function TerminalScreen() {
     );
   }
 
+  // ── Terminal view ──────────────────────────────────────────────────────────
+  if (view === 'term' && activeId) {
+    return (
+      <View style={styles.container}>
+        <View style={styles.termHeader}>
+          <TouchableOpacity onPress={leaveToList}>
+            <Text style={styles.headerBtn}>‹ Sessions</Text>
+          </TouchableOpacity>
+          <Text style={styles.headerTitle} numberOfLines={1}>{activeId}</Text>
+          <TouchableOpacity onPress={() => killSession(activeId)}>
+            <Text style={[styles.headerBtn, styles.killBtn]}>Kill</Text>
+          </TouchableOpacity>
+        </View>
+        <WebView
+          key={activeId}            /* fresh xterm per session */
+          ref={webviewRef}
+          source={{ html: TERMINAL_HTML }}
+          style={styles.webview}
+          onMessage={handleWebViewMessage}
+          originWhitelist={['*']}
+          keyboardDisplayRequiresUserAction={false}
+        />
+      </View>
+    );
+  }
+
+  // ── Session list view ───────────────────────────────────────────────────────
   return (
     <View style={styles.container}>
-      <WebView
-        ref={webviewRef}
-        source={{ html: TERMINAL_HTML }}
-        style={styles.webview}
-        onMessage={handleWebViewMessage}
-        originWhitelist={['*']}
-        allowsInlineMediaPlayback
-        mediaPlaybackRequiresUserAction={false}
+      <View style={styles.header}>
+        <Text style={styles.heading}>Sessions</Text>
+        <TouchableOpacity onPress={refreshList}>
+          <Text style={styles.headerBtn}>Refresh</Text>
+        </TouchableOpacity>
+      </View>
+
+      <TouchableOpacity style={styles.newBtn} onPress={createSession}>
+        <Text style={styles.newBtnText}>+ New Session</Text>
+      </TouchableOpacity>
+
+      <FlatList
+        data={sessions}
+        keyExtractor={(s) => s.id}
+        ListEmptyComponent={<Text style={styles.empty}>No sessions yet. Tap “New Session”.</Text>}
+        renderItem={({ item }) => (
+          <TouchableOpacity style={styles.row} onPress={() => openSession(item.id)}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.rowTitle}>{item.title}</Text>
+              <Text style={styles.rowSub}>{item.id} · {item.cols}×{item.rows}{item.alive ? '' : ' · exited'}</Text>
+            </View>
+            <TouchableOpacity onPress={() => killSession(item.id)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+              <Text style={[styles.headerBtn, styles.killBtn]}>Kill</Text>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        )}
+        ItemSeparatorComponent={() => <View style={styles.separator} />}
       />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0d0d0d' },
-  webview:   { flex: 1, backgroundColor: '#0d0d0d' },
-  center:    {
-    flex: 1,
-    backgroundColor: '#0d0d0d',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 24,
-  },
-  notice: { color: '#aaaaaa', fontSize: 15, textAlign: 'center' },
+  container:   { flex: 1, backgroundColor: '#0d0d0d' },
+  webview:     { flex: 1, backgroundColor: '#0d0d0d' },
+  center:      { flex: 1, backgroundColor: '#0d0d0d', alignItems: 'center', justifyContent: 'center', padding: 24 },
+  notice:      { color: '#aaaaaa', fontSize: 15, textAlign: 'center' },
+  header:      { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 16, borderBottomWidth: 1, borderBottomColor: '#222' },
+  termHeader:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 12, backgroundColor: '#111', borderBottomWidth: 1, borderBottomColor: '#222' },
+  heading:     { color: '#e0e0e0', fontSize: 20, fontWeight: '700' },
+  headerBtn:   { color: '#4fc3f7', fontSize: 15 },
+  headerTitle: { color: '#888', fontSize: 13, fontFamily: 'monospace', flex: 1, textAlign: 'center' },
+  killBtn:     { color: '#ef5350' },
+  newBtn:      { margin: 16, padding: 14, borderRadius: 8, borderWidth: 1, borderColor: '#4fc3f7', alignItems: 'center' },
+  newBtnText:  { color: '#4fc3f7', fontSize: 16, fontWeight: '600' },
+  empty:       { color: '#555', textAlign: 'center', marginTop: 24, fontSize: 14 },
+  row:         { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 14 },
+  rowTitle:    { color: '#e0e0e0', fontSize: 16 },
+  rowSub:      { color: '#666', fontSize: 12, fontFamily: 'monospace', marginTop: 2 },
+  separator:   { height: 1, backgroundColor: '#1a1a1a', marginLeft: 16 },
 });

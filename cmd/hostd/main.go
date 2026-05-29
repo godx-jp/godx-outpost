@@ -99,15 +99,19 @@ func pairingBlock(mgr *auth.Manager, wsURL string, ttl time.Duration) {
 	fmt.Printf("Pairing code    : %s  (valid %s)\n\n", code, ttl)
 }
 
-// makeHandlers returns a FRESH slice of channel.Handler values. It is called
-// once per accepted WebSocket connection so every connection starts with
-// clean, per-connection state (open PTY sessions, metric subscriptions, …).
-func makeHandlers() []channel.Handler {
-	return []channel.Handler{
-		term.New(launcher.NewDirect()),
-		fs.New(),
-		sys.New(),
-		customapi.New(),
+// makeHandlersFunc returns a factory that builds a FRESH slice of
+// channel.Handler values per accepted connection. Per-connection handlers keep
+// connection-scoped state (metric tickers, which sessions this connection is
+// attached to), but the terminal session Manager is SHARED across all
+// connections so terminal sessions outlive any single connection (tmux-like).
+func makeHandlersFunc(sessions *term.Manager) func() []channel.Handler {
+	return func() []channel.Handler {
+		return []channel.Handler{
+			term.New(sessions),
+			fs.New(),
+			sys.New(),
+			customapi.New(),
+		}
 	}
 }
 
@@ -133,9 +137,13 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 			addr := bind + ":" + port
 			wsURL := "ws://" + addr
 
-			// Build the WebSocket server. makeHandlers is called fresh per
-			// connection so channel state (PTYs, tickers, …) is isolated.
-			srv := server.New(mgr, makeHandlers)
+			// Shared terminal session manager: one per daemon, so sessions
+			// survive connection drops and can be re-attached later.
+			sessions := term.NewManager(launcher.NewDirect())
+
+			// Build the WebSocket server. The handler factory runs fresh per
+			// connection; only the terminal Manager is shared.
+			srv := server.New(mgr, makeHandlersFunc(sessions))
 
 			// Print the pairing QR before blocking.
 			pairingBlock(mgr, wsURL, pairTTL)

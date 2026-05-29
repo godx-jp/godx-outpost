@@ -26,8 +26,9 @@ interface FileEntry {
   size?: number;
 }
 
+// The server's fs "list" reply carries only { entries }. The current directory
+// is tracked client-side from the path we requested.
 interface ListResponse {
-  cwd:     string;
   entries: FileEntry[];
 }
 
@@ -39,6 +40,8 @@ export default function FilesScreen() {
 
   const cwdRef = useRef(cwd);
   cwdRef.current = cwd;
+  // Path of the in-flight list request; promoted to cwd when it succeeds.
+  const pendingPathRef = useRef('~');
 
   useEffect(() => {
     if (!wsClient.isConnected) return;
@@ -48,15 +51,18 @@ export default function FilesScreen() {
       prevOnEnvelope?.(env);
       if (env.ch !== Ch.FS) return;
 
-      if (env.type === 'list') {
-        const d = env.data as ListResponse;
-        setEntries(d.entries ?? []);
-        setCwd(d.cwd ?? '~');
-        setLoading(false);
-      }
-
+      // Error envelopes carry no data — handle them first to avoid touching
+      // env.data (which is undefined on error).
       if (env.err) {
         setError(env.err);
+        setLoading(false);
+        return;
+      }
+
+      if (env.type === 'list') {
+        const d = (env.data ?? {}) as ListResponse;
+        setEntries(d.entries ?? []);
+        setCwd(pendingPathRef.current); // server doesn't echo cwd
         setLoading(false);
       }
     };
@@ -70,6 +76,7 @@ export default function FilesScreen() {
 
   const listDir = (path: string) => {
     if (!wsClient.isConnected) return;
+    pendingPathRef.current = path;
     setLoading(true);
     setError('');
     wsClient.send({ ch: Ch.FS, type: 'list', data: { path } });

@@ -1,57 +1,66 @@
-// Package term implements the TERMINAL channel (protocol.ChTerm).
-//
-// One Handler instance is created per authenticated client connection. It
-// manages a map of running PTY sessions, keyed by the sessionId chosen by
-// the client. Inbound text envelopes drive session lifecycle (open/resize/close)
-// while inbound binary frames (BinTermInput) feed keystrokes to the PTY; the
-// PTY output is streamed back as BinTermOutput binary frames.
 package term
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"sync"
 
 	"github.com/famgia/remote-host/internal/channel"
-	"github.com/famgia/remote-host/internal/launcher"
 	"github.com/famgia/remote-host/internal/protocol"
 )
 
-// Handler handles the ChTerm channel for a single connection.
-// It implements channel.Handler and channel.BinaryHandler.
+// Handler is the per-connection adapter to the shared session Manager. It
+// implements channel.Handler and channel.BinaryHandler.
 //
-// One Handler instance per connection is assumed; the server constructs a new
-// Handler for each incoming authenticated WebSocket connection.
+// Message types (text envelopes on ChTerm), correlated by e.ID:
+//
+//	list                              → "list"     {sessions:[SessionInfo]}
+//	create  {cols,rows,title?}        → "created"  {sessionId,title} + scrollback
+//	attach  {sessionId,cols?,rows?}   → "attached" {sessionId}        + scrollback
+//	detach  {sessionId}               → "detached" {sessionId}   (session stays alive)
+//	resize  {sessionId,cols,rows}
+//	kill    {sessionId}               → "killed"   {sessionId}   (terminates the shell)
+//
+// Binary frames: BinTermInput (keystrokes) and BinTermOutput (output), keyed by
+// the sessionId in StreamID. A session's exit is announced with "exit"
+// {sessionId} to every attached connection.
+//
+// On connection close the Handler DETACHES from every session it attached to —
+// it never kills them, so they keep running for a later re-attach.
 type Handler struct {
-	launcher launcher.Launcher
+	mgr *Manager
 
 	mu       sync.Mutex
-	sessions map[string]launcher.Session // keyed by sessionId
+	attached map[string]int // sessionId → this connection's subscriber id
 }
 
-// Compile-time interface assertions.
 var _ channel.Handler = (*Handler)(nil)
 var _ channel.BinaryHandler = (*Handler)(nil)
 
-// New returns a Handler that uses l to spawn shell sessions.
-func New(l launcher.Launcher) *Handler {
-	return &Handler{
-		launcher: l,
-		sessions: make(map[string]launcher.Session),
-	}
+// New returns a per-connection Handler bound to the shared session Manager.
+func New(mgr *Manager) *Handler {
+	return &Handler{mgr: mgr, attached: make(map[string]int)}
 }
 
 // Channel returns the channel this handler serves.
 func (h *Handler) Channel() protocol.Channel { return protocol.ChTerm }
 
-// ---- envelope data shapes ---------------------------------------------------
+// ---- message payloads -------------------------------------------------------
 
-type openData struct {
+type createData struct {
+	Cols  uint16 `json:"cols"`
+	Rows  uint16 `json:"rows"`
+	Title string `json:"title"`
+}
+
+type attachData struct {
 	SessionID string `json:"sessionId"`
 	Cols      uint16 `json:"cols"`
 	Rows      uint16 `json:"rows"`
+}
+
+type sessionRef struct {
+	SessionID string `json:"sessionId"`
 }
 
 type resizeData struct {
@@ -60,197 +69,192 @@ type resizeData struct {
 	Rows      uint16 `json:"rows"`
 }
 
-type closeData struct {
-	SessionID string `json:"sessionId"`
+// connSub forwards a session's output/exit to one WebSocket connection.
+type connSub struct {
+	c         channel.Conn
+	sessionID string
 }
 
-type exitData struct {
-	SessionID string `json:"sessionId"`
+func (cs *connSub) Output(payload []byte) {
+	_ = cs.c.SendBinary(protocol.BinaryFrame{
+		Kind:     protocol.BinTermOutput,
+		StreamID: cs.sessionID,
+		Payload:  payload,
+	})
+}
+
+func (cs *connSub) Exit() {
+	env, err := protocol.NewEnvelope(protocol.ChTerm, "exit", "", sessionRef{SessionID: cs.sessionID})
+	if err == nil {
+		_ = cs.c.Send(env)
+	}
 }
 
 // ---- Handle -----------------------------------------------------------------
 
-// Handle dispatches inbound text-frame envelopes on the term channel.
-// Supported types: "open", "resize", "close".
-func (h *Handler) Handle(ctx context.Context, e protocol.Envelope, c channel.Conn) error {
+func (h *Handler) Handle(_ context.Context, e protocol.Envelope, c channel.Conn) error {
 	switch e.Type {
-	case "open":
-		return h.handleOpen(ctx, e, c)
+	case "list":
+		return h.list(e, c)
+	case "create":
+		return h.create(e, c)
+	case "attach":
+		return h.attach(e, c)
+	case "detach", "close": // "close" kept as a detach alias for older clients
+		return h.detach(e, c)
 	case "resize":
-		return h.handleResize(e)
-	case "close":
-		return h.handleClose(e)
+		return h.resize(e)
+	case "kill":
+		return h.kill(e, c)
 	default:
-		return fmt.Errorf("term: unknown envelope type %q", e.Type)
+		return fmt.Errorf("term: unknown type %q", e.Type)
 	}
 }
 
-// handleOpen launches a new shell session and starts copying PTY output to the client.
-func (h *Handler) handleOpen(_ context.Context, e protocol.Envelope, c channel.Conn) error {
-	var d openData
-	if err := e.Bind(&d); err != nil {
-		return fmt.Errorf("term: open: bad data: %w", err)
-	}
-	if d.SessionID == "" {
-		return fmt.Errorf("term: open: sessionId required")
-	}
-
-	// Hold the lock across the existence check AND the store so two concurrent
-	// opens with the same sessionId cannot both pass the check and leak a PTY
-	// (the second store would otherwise silently overwrite — and orphan — the
-	// first). StartShell is a fast fork+exec; holding the per-connection lock
-	// for its duration only briefly serializes this one client's term ops.
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if _, exists := h.sessions[d.SessionID]; exists {
-		return fmt.Errorf("term: open: session %q already exists", d.SessionID)
-	}
-
-	sess, err := h.launcher.StartShell(c.Profile(), launcher.Size{Cols: d.Cols, Rows: d.Rows})
+func (h *Handler) list(e protocol.Envelope, c channel.Conn) error {
+	env, err := protocol.NewEnvelope(protocol.ChTerm, "list", e.ID,
+		map[string]any{"sessions": h.mgr.List()})
 	if err != nil {
-		return fmt.Errorf("term: open: start shell: %w", err)
+		return err
 	}
-	h.sessions[d.SessionID] = sess
-
-	// Goroutine: copy PTY output → BinTermOutput frames, then send "exit".
-	// It briefly blocks on h.mu (to delete the session on exit) until this
-	// function returns and releases the lock.
-	go h.pumpOutput(sess, d.SessionID, c)
-
-	return nil
+	return c.Send(env)
 }
 
-// pumpOutput reads PTY output and forwards it to the client as binary frames.
-// When the PTY reaches EOF it sends an "exit" envelope.
-func (h *Handler) pumpOutput(sess launcher.Session, sessionID string, c channel.Conn) {
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := sess.Read(buf)
-		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			frame := protocol.BinaryFrame{
-				Kind:     protocol.BinTermOutput,
-				StreamID: sessionID,
-				Payload:  chunk,
-			}
-			if sendErr := c.SendBinary(frame); sendErr != nil {
-				// Connection is gone; stop pumping.
-				break
-			}
-		}
-		if err != nil {
-			// EOF or error — shell exited.
-			break
-		}
+func (h *Handler) create(e protocol.Envelope, c channel.Conn) error {
+	var d createData
+	if err := e.Bind(&d); err != nil {
+		return fmt.Errorf("term: create: %w", err)
 	}
+	s, err := h.mgr.Create(c.Profile(), d.Cols, d.Rows, d.Title)
+	if err != nil {
+		return err
+	}
+	h.bind(s, c)
+	env, err := protocol.NewEnvelope(protocol.ChTerm, "created", e.ID,
+		map[string]any{"sessionId": s.ID(), "title": s.Info().Title})
+	if err != nil {
+		return err
+	}
+	return c.Send(env)
+}
 
-	// Wait for the process to exit so we get a clean exit status (ignore error).
-	_ = sess.Wait()
+func (h *Handler) attach(e protocol.Envelope, c channel.Conn) error {
+	var d attachData
+	if err := e.Bind(&d); err != nil {
+		return fmt.Errorf("term: attach: %w", err)
+	}
+	s, ok := h.mgr.Get(d.SessionID)
+	if !ok {
+		return fmt.Errorf("term: no such session %q", d.SessionID)
+	}
+	if d.Cols > 0 && d.Rows > 0 {
+		_ = s.Resize(d.Cols, d.Rows)
+	}
+	scrollback := h.bind(s, c)
+	// Replay recent output so the client picks up where the session was.
+	if len(scrollback) > 0 {
+		_ = c.SendBinary(protocol.BinaryFrame{
+			Kind: protocol.BinTermOutput, StreamID: s.ID(), Payload: scrollback,
+		})
+	}
+	env, err := protocol.NewEnvelope(protocol.ChTerm, "attached", e.ID,
+		sessionRef{SessionID: s.ID()})
+	if err != nil {
+		return err
+	}
+	return c.Send(env)
+}
 
-	// Remove the session from the map.
+// bind attaches this connection to s, replacing any prior attachment to the
+// same session, and returns the scrollback to replay.
+func (h *Handler) bind(s *Session, c channel.Conn) []byte {
+	subID, scrollback := s.Attach(&connSub{c: c, sessionID: s.ID()})
 	h.mu.Lock()
-	delete(h.sessions, sessionID)
-	h.mu.Unlock()
-
-	// Notify the client that the session has ended.
-	payload, _ := json.Marshal(exitData{SessionID: sessionID})
-	env := protocol.Envelope{
-		Ch:   protocol.ChTerm,
-		Type: "exit",
-		Data: json.RawMessage(payload),
+	if old, exists := h.attached[s.ID()]; exists {
+		s.Detach(old)
 	}
-	_ = c.Send(env)
+	h.attached[s.ID()] = subID
+	h.mu.Unlock()
+	return scrollback
 }
 
-// handleResize forwards a window-size change to the running session.
-func (h *Handler) handleResize(e protocol.Envelope) error {
+func (h *Handler) detach(e protocol.Envelope, c channel.Conn) error {
+	var d sessionRef
+	if err := e.Bind(&d); err != nil {
+		return fmt.Errorf("term: detach: %w", err)
+	}
+	h.mu.Lock()
+	subID, ok := h.attached[d.SessionID]
+	if ok {
+		delete(h.attached, d.SessionID)
+	}
+	h.mu.Unlock()
+	if ok {
+		if s, exists := h.mgr.Get(d.SessionID); exists {
+			s.Detach(subID)
+		}
+	}
+	env, err := protocol.NewEnvelope(protocol.ChTerm, "detached", e.ID, d)
+	if err != nil {
+		return err
+	}
+	return c.Send(env)
+}
+
+func (h *Handler) resize(e protocol.Envelope) error {
 	var d resizeData
 	if err := e.Bind(&d); err != nil {
-		return fmt.Errorf("term: resize: bad data: %w", err)
+		return fmt.Errorf("term: resize: %w", err)
 	}
-	if d.SessionID == "" {
-		return fmt.Errorf("term: resize: sessionId required")
-	}
-
-	h.mu.Lock()
-	sess, ok := h.sessions[d.SessionID]
-	h.mu.Unlock()
+	s, ok := h.mgr.Get(d.SessionID)
 	if !ok {
-		return fmt.Errorf("term: resize: session %q not found", d.SessionID)
+		return fmt.Errorf("term: resize: no such session %q", d.SessionID)
 	}
-	return sess.Resize(launcher.Size{Cols: d.Cols, Rows: d.Rows})
+	return s.Resize(d.Cols, d.Rows)
 }
 
-// handleClose terminates and removes a session.
-func (h *Handler) handleClose(e protocol.Envelope) error {
-	var d closeData
+func (h *Handler) kill(e protocol.Envelope, c channel.Conn) error {
+	var d sessionRef
 	if err := e.Bind(&d); err != nil {
-		return fmt.Errorf("term: close: bad data: %w", err)
+		return fmt.Errorf("term: kill: %w", err)
 	}
-	if d.SessionID == "" {
-		return fmt.Errorf("term: close: sessionId required")
+	if err := h.mgr.Kill(d.SessionID); err != nil {
+		return err
 	}
-	return h.removeSession(d.SessionID)
-}
-
-// removeSession closes and deletes a session by id. Returns an error if the
-// session does not exist.
-func (h *Handler) removeSession(sessionID string) error {
 	h.mu.Lock()
-	sess, ok := h.sessions[sessionID]
-	if ok {
-		delete(h.sessions, sessionID)
-	}
+	delete(h.attached, d.SessionID)
 	h.mu.Unlock()
-
-	if !ok {
-		return fmt.Errorf("term: session %q not found", sessionID)
+	env, err := protocol.NewEnvelope(protocol.ChTerm, "killed", e.ID, d)
+	if err != nil {
+		return err
 	}
-	return sess.Close()
+	return c.Send(env)
 }
 
-// ---- HandleBinary -----------------------------------------------------------
-
-// HandleBinary routes BinTermInput frames to the appropriate PTY session.
+// HandleBinary routes keystroke frames to the target session's PTY.
 func (h *Handler) HandleBinary(_ context.Context, f protocol.BinaryFrame, _ channel.Conn) error {
 	if f.Kind != protocol.BinTermInput {
-		// Not our kind; ignore silently.
 		return nil
 	}
-
-	h.mu.Lock()
-	sess, ok := h.sessions[f.StreamID]
-	h.mu.Unlock()
+	s, ok := h.mgr.Get(f.StreamID)
 	if !ok {
-		return fmt.Errorf("term: binary input: session %q not found", f.StreamID)
+		return fmt.Errorf("term: input: no such session %q", f.StreamID)
 	}
-
-	_, err := io.Writer(sess).Write(f.Payload)
-	if err != nil {
-		return fmt.Errorf("term: binary input: write: %w", err)
-	}
-	return nil
+	return s.Write(f.Payload)
 }
 
-// ---- Close ------------------------------------------------------------------
-
-// Close terminates all sessions associated with this connection.
-// Called by the server when the WebSocket connection goes away.
+// Close detaches this connection from every session it attached to. Sessions
+// keep running (tmux-like) so another connection can re-attach later.
 func (h *Handler) Close() error {
 	h.mu.Lock()
-	sessions := make(map[string]launcher.Session, len(h.sessions))
-	for id, sess := range h.sessions {
-		sessions[id] = sess
-	}
-	h.sessions = make(map[string]launcher.Session)
+	attached := h.attached
+	h.attached = make(map[string]int)
 	h.mu.Unlock()
 
-	var firstErr error
-	for _, sess := range sessions {
-		if err := sess.Close(); err != nil && firstErr == nil {
-			firstErr = err
+	for id, subID := range attached {
+		if s, ok := h.mgr.Get(id); ok {
+			s.Detach(subID)
 		}
 	}
-	return firstErr
+	return nil
 }
