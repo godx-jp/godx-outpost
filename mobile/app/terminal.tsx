@@ -72,18 +72,17 @@ const TERMINAL_HTML = `<!DOCTYPE html>
       }));
     });
 
-    // RN -> WebView: render output
-    window.addEventListener('message', (event) => {
+    // RN -> WebView: render base64-encoded output bytes. RN calls this
+    // directly via injectJavaScript (simpler and safer than dispatching a
+    // synthetic MessageEvent).
+    window.__termWrite = function (b64) {
       try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'term/output') {
-          const bin   = atob(msg.data);
-          const bytes = new Uint8Array(bin.length);
-          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-          term.write(bytes);
-        }
+        const bin   = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        term.write(bytes);
       } catch (_) { /* ignore */ }
-    });
+    };
 
     term.writeln('\\x1b[1;34mremote-host\\x1b[0m – waiting for connection…');
   </script>
@@ -96,8 +95,13 @@ export default function TerminalScreen() {
   useEffect(() => {
     if (!wsClient.isConnected) return;
 
-    // Open a PTY session on the host
-    wsClient.send({ ch: Ch.Term, type: 'open', data: { sessionID: SESSION_ID } });
+    // Open a PTY session on the host. The server keys sessions by "sessionId";
+    // cols/rows are seeded here and refined by the WebView's resize message.
+    wsClient.send({
+      ch: Ch.Term,
+      type: 'open',
+      data: { sessionId: SESSION_ID, cols: 80, rows: 24 },
+    });
 
     // Route binary output from host to the WebView
     const prevOnBinary = wsClient.onBinary;
@@ -109,16 +113,16 @@ export default function TerminalScreen() {
       frame.payload.forEach((b) => (bin += String.fromCharCode(b)));
       const b64 = btoa(bin);
 
+      // Call the WebView's write function directly. JSON.stringify produces a
+      // safely-quoted JS string literal; trailing `true;` keeps WKWebView happy.
       webviewRef.current?.injectJavaScript(
-        `window.dispatchEvent(new MessageEvent('message',{data:${JSON.stringify(
-          JSON.stringify({ type: 'term/output', data: b64 })
-        )})));void 0;`
+        `window.__termWrite(${JSON.stringify(b64)});true;`
       );
     };
 
     return () => {
       wsClient.onBinary = prevOnBinary;
-      wsClient.send({ ch: Ch.Term, type: 'close', data: { sessionID: SESSION_ID } });
+      wsClient.send({ ch: Ch.Term, type: 'close', data: { sessionId: SESSION_ID } });
     };
   }, []);
 
@@ -142,7 +146,7 @@ export default function TerminalScreen() {
         wsClient.send({
           ch:   Ch.Term,
           type: 'resize',
-          data: { sessionID: SESSION_ID, cols: msg.cols, rows: msg.rows },
+          data: { sessionId: SESSION_ID, cols: msg.cols, rows: msg.rows },
         });
       }
     } catch {
