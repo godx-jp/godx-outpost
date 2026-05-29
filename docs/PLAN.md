@@ -30,18 +30,24 @@ Vấn đề lõi: máy host thường nằm sau NAT/firewall, không có IP publ
    PTY / FS / metrics / custom              ghép ống theo deviceID                 UI điều khiển
 ```
 
-Có **3 thành phần code**:
+Có **2 thành phần code** (lúc đầu):
 
-1. **`hostd` — CLI + server (Go)**: chạy trên máy host. Bật các "service" (terminal, file, monitor, custom), dial ra relay, in QR pairing ra terminal.
-2. **`relay` — relay server (Go)**: deploy 1 lần lên VPS (hoặc dùng tunnel sẵn có ở v0 — xem dưới). Stateless, chỉ ghép kết nối + xác thực token.
-3. **`mobile` — app React Native (Expo)**: quét QR, lưu token, UI cho 4 nhóm chức năng.
+1. **`hostd` — CLI + server (Go)**: chạy trên máy host. Bật các "service" (terminal, file, monitor, custom), lắng nghe WebSocket, in QR pairing ra terminal.
+2. **`mobile` — app React Native (Expo)**: quét QR, lưu token, UI cho 4 nhóm chức năng.
 
-### Lựa chọn relay vs tunnel (chiến lược 2 giai đoạn)
+### Tầng mạng = chỉ là 1 URL (endpoint-agnostic)
 
-- **v0 (làm trước, để chạy được nhanh)**: bỏ qua việc tự viết relay. CLI tự spawn **`cloudflared` tunnel** (hoặc tích hợp lib tunnel) để lấy 1 URL public `https://xxx.trycloudflare.com`, nhúng URL đó vào QR. App kết nối thẳng. Ưu điểm: không cần VPS, làm xong sớm.
-- **v1 (sản phẩm hoàn chỉnh)**: tự viết `relay` deploy lên VPS của bạn, dùng `deviceID` cố định + reconnect, không phụ thuộc bên thứ ba, URL không đổi mỗi lần chạy.
+**Nguyên tắc cốt lõi: cách host "lộ ra Internet" chỉ là 1 chuỗi URL trong QR/config, KHÔNG dính vào core.** App chỉ biết "dial tới URL này"; `hostd` chỉ biết "lắng nghe ở đây". Protocol WebSocket/envelope y hệt nhau dù URL là gì.
 
-Plan này build theo thứ tự đó: chạy được trước (v0), rồi mới tự chủ hạ tầng (v1).
+Vì vậy không cần quyết hạ tầng ngay. Lộ trình về mạng:
+
+- **Bây giờ (dev/local)**: chạy thẳng `ws://127.0.0.1:PORT` (hoặc IP LAN). Đủ để build & test toàn bộ chức năng. **Không cần tunnel, không cần relay, không cần VPS.**
+- **Khi cần remote**: chỉ việc **đổi hostname trong QR** — không sửa code core:
+  - **Tailscale** (khuyên cho cá nhân): cài 2 đầu → IP cố định `100.x` + P2P trực tiếp, mượt nhất, mã hóa sẵn.
+  - **Cloudflare Tunnel**: URL public, không cần cài client phía điện thoại — nhưng public nên **bắt buộc** token verify mọi channel + nên đặt Cloudflare Access ở edge.
+  - **Relay tự viết / Headscale**: nếu sau này muốn tự chủ hoàn toàn.
+
+Tóm lại: build core trước trên `127.0.0.1`, hạ tầng mạng nhét vào sau bằng cách đổi URL.
 
 ---
 
@@ -73,8 +79,10 @@ Thiết kế envelope theo `ch` giúp thêm chức năng mới mà không phá v
 - Token/ký: **`golang-jwt/jwt/v5`** hoặc token ngẫu nhiên 256-bit + HMAC.
 - Config/secret lưu tại `~/.config/hostd/` (deviceID, token đã cấp, relay URL).
 
-### Relay (`relay`, Go) — cho v1
-- Cùng `coder/websocket`. In-memory map `deviceID → hostConn`. Ghép app ↔ host, copy bytes 2 chiều. TLS do reverse proxy (Caddy/Cloudflare) lo, hoặc `autocert`.
+### Tầng mạng — không cần lib riêng lúc đầu
+- Dev: `hostd` lắng nghe `ws://127.0.0.1:PORT` (hoặc `0.0.0.0` cho LAN). Không cần thư viện gì thêm.
+- Remote (sau): **Tailscale** (cài ngoài, không phải code) hoặc **Cloudflare Tunnel** (`cloudflared` chạy cạnh, không nhúng vào binary). Chỉ là đổi hostname trong QR.
+- Nếu sau này tự viết `relay`: cùng `coder/websocket`, in-memory map `deviceID → hostConn`, copy bytes 2 chiều, TLS do reverse proxy (Caddy) lo.
 
 ### App (`mobile`, React Native + Expo)
 - **Expo** (managed) cho nhanh; nếu cần module native thì prebuild.
@@ -110,11 +118,39 @@ Mô hình token: dùng cặp **access token (ngắn hạn) + refresh token (dài
 - Mất mạng → app **tự reconnect** (backoff) dùng access token; nếu access token hết hạn → dùng refresh token để lấy access token mới (silent re-login, người dùng không thấy gì).
 - Chỉ khi **refresh token bị revoke hoặc xóa app** mới cần pair lại bằng QR (lúc đó bạn buộc phải về gần máy host — đúng kỳ vọng bảo mật).
 
-Phía mạng:
-- **Với relay (v1)**: deviceID cố định + URL relay cố định → app reconnect được từ bất cứ đâu, kể cả host vừa khởi động lại (host cũng tự dial lại relay khi mạng có lại).
-- **Với tunnel v0 (cloudflared free)**: URL đổi mỗi lần chạy → đây chính là điểm yếu khiến reconnect-từ-xa không ổn định. Khắc phục tạm: dùng **named tunnel** (cloudflared có domain cố định) hoặc đẩy sớm sang relay v1. Ghi rõ giới hạn này.
+Phía mạng (chỉ là chuyện URL cố định hay không):
+- **Local `127.0.0.1` / LAN**: URL cố định trong môi trường đó → reconnect ổn.
+- **Tailscale**: MagicDNS hostname **cố định** → app reconnect từ bất cứ đâu, kể cả host vừa reboot. Lựa chọn tốt nhất cho remote.
+- **Cloudflare named tunnel**: domain **cố định** → reconnect ổn. (Tránh `trycloudflare` free vì URL đổi mỗi lần chạy.)
+Điểm chung: chỉ cần endpoint URL **không đổi** thì reconnect-bằng-token chạy tốt — và đó là thứ ta cấu hình, không phải code.
 
 Hệ quả thiết kế: `hostd start` phải **idempotent** về danh tính — đọc lại deviceID/khóa/token store cũ nếu đã có, chỉ tạo mới khi chưa tồn tại.
+
+---
+
+## Session profiles & sandbox (bảo mật theo từng phiên)
+
+Mục tiêu: **mỗi session có thể chạy dưới một "profile" khác nhau** để cô lập. Admin → vào thẳng host; khách → bị nhốt trong sandbox (không thấy file/tiến trình/mạng ngoài phạm vi cho phép).
+
+**Thiết kế (đã chốt, triển khai ở M5):** trừu tượng hoá việc spawn shell sau một interface — core không quan tâm sandbox kiểu gì:
+
+```go
+type Launcher interface {
+    StartShell(p Profile) (*Session, error)   // channel term gọi cái này thay vì spawn $SHELL trực tiếp
+}
+```
+
+- **Profile** mô tả quyền của session: thư mục/rootfs được thấy, có cô lập mạng không (+ policy), giới hạn CPU/RAM/PID, và được phép dùng channel/custom-API nào. **Token của thiết bị → ánh xạ tới một profile.**
+- Các implementation của `Launcher` (chọn theo profile):
+  - `direct` — PTY thẳng trên host. **Dành cho admin.** Đây là cái M1–M3 dùng (làm trước).
+  - `bwrap`/`namespaces` (Linux) — bó namespace `mount`+`pid`+`net`(netns)+`user`+`uts`+`ipc` + cgroups. Dùng **bubblewrap** cho gọn, không tự code namespace.
+  - `sandbox-exec` (macOS) — Seatbelt profile.
+  - `container` (Podman/Docker) — cô lập mạnh nhất, nặng hơn.
+
+**Lưu ý quan trọng:**
+- `netns` **một mình không đủ** — nó chỉ cô lập mạng; shell vẫn đọc được mọi file/tiến trình. Muốn an toàn phải dùng cả bó namespace ở trên.
+- Namespaces là **Linux-only**. macOS phải dùng `sandbox-exec` hoặc VM/container Linux. Cơ chế cụ thể quyết khi tới M5 (chưa chốt OS host).
+- Vì core gọi qua interface `Launcher`, M1–M3 cứ chạy `direct`; thêm sandbox sau **không phải sửa channel `term`**.
 
 ---
 
@@ -124,15 +160,16 @@ Hệ quả thiết kế: `hostd start` phải **idempotent** về danh tính —
 remote-host/
 ├── go.mod
 ├── cmd/
-│   ├── hostd/main.go        # CLI entrypoint (cobra)
-│   └── relay/main.go        # relay server (v1)
+│   └── hostd/main.go        # CLI entrypoint (cobra)
+│   # (relay/ chỉ thêm về sau nếu tự host hạ tầng — không cần ở giai đoạn đầu)
 ├── internal/
 │   ├── server/              # websocket hub, envelope router theo ch
 │   ├── term/                # PTY qua creack/pty
 │   ├── fs/                  # file ops
 │   ├── sys/                 # gopsutil metrics
 │   ├── customapi/           # registry handler tùy chỉnh
-│   ├── auth/                # pairing, token, (E2E key sau)
+│   ├── launcher/            # Launcher interface: direct (M1) → bwrap/sandbox-exec/container (M5)
+│   ├── auth/                # pairing, token, profile-per-session, (E2E key sau)
 │   └── qr/                  # render QR + đóng gói payload pairing
 └── mobile/                  # Expo React Native app
     ├── app/                 # expo-router screens: pair, term, files, monitor, custom
@@ -159,14 +196,17 @@ remote-host/
 - Channel `api`: registry để bạn đăng ký handler riêng + ví dụ mẫu.
 - App: 3 tab UI tương ứng.
 
-**M4 — Remote qua Internet (v0 tunnel)**
-- CLI tích hợp/spawn cloudflared tunnel → lấy URL public → nhúng vào QR.
-- Test thực tế từ 4G điện thoại (khác mạng với host).
+**M4 — Remote qua Internet (chỉ đổi hostname, KHÔNG sửa core)**
+- Vì endpoint đã tách thành URL config, chỉ cần trỏ QR sang hostname remote:
+  - **Tailscale** (mặc định khuyên dùng): cài 2 đầu, QR chứa `ws://<magicdns>:PORT`. Test từ 4G — đục NAT P2P, đo độ trễ.
+  - hoặc **Cloudflare Tunnel**: `cloudflared` trên host → `wss://<domain>`, nhúng vào QR. Vì public → kiểm tra kỹ token verify + cân nhắc Cloudflare Access.
+- Reconnect/backoff, heartbeat khi mạng chập chờn.
 
-**M5 — Relay tự chủ (v1) + hardening**
-- Viết `cmd/relay`, deploy VPS (Caddy + TLS). Host & app reconnect theo deviceID cố định.
-- Reconnect/backoff, heartbeat, `hostd revoke`, rate-limit pairing.
-- (Tùy chọn M6) E2E encryption, multi-device, log.
+**M5 — Hardening + sandbox theo profile + (tùy chọn) hạ tầng tự chủ**
+- **Session profiles + sandbox**: triển khai `Launcher` ngoài `direct` — `bwrap` (Linux) hoặc `sandbox-exec` (macOS) tuỳ OS host chốt lúc đó. Token → profile; admin = `direct`, khách = sandbox.
+- `hostd revoke`, rate-limit pairing, audit log.
+- (Tùy chọn) E2E encryption, multi-device.
+- (Tùy chọn) Tự host relay/Headscale nếu không muốn phụ thuộc bên thứ ba.
 
 ---
 
@@ -185,5 +225,5 @@ remote-host/
 
 - **An ninh là tối quan trọng**: server này cho phép chạy shell từ xa → nếu lộ là chiếm máy. Bắt buộc token verify trước mọi channel, pairing code hết hạn nhanh, nên có E2E. Cảnh báo rõ trong README.
 - **xterm.js trong WebView**: cầu nối postMessage có thể là điểm nghẽn hiệu năng/độ trễ — cần test kỹ ở M1.
-- **cloudflared free tunnel**: URL đổi mỗi lần chạy + giới hạn dùng → chỉ hợp cho v0/demo, không cho production. Đó là lý do có M5 (relay riêng).
+- **Tầng mạng để sau**: vì endpoint chỉ là URL, đừng để quyết định Tailscale/Cloudflare chặn việc build core. Làm xong chức năng trên `127.0.0.1` rồi mới gắn hostname remote. Lưu ý `trycloudflare` free đổi URL mỗi lần chạy → nếu dùng Cloudflare thì chọn named tunnel.
 - **gopsutil & PTY** hành xử khác nhau giữa macOS/Linux/Windows → ưu tiên macOS/Linux trước, Windows sau.
