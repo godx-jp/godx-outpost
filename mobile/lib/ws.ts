@@ -41,29 +41,44 @@ async function secureStore(): Promise<SecureStore> {
 const TOKEN_KEY_ACCESS  = 'rh_access_token';
 const TOKEN_KEY_REFRESH = 'rh_refresh_token';
 
+// Token persistence is best-effort: expo-secure-store is unavailable on web,
+// so all access is guarded. A failure to persist must not break pairing — it
+// just means the session isn't remembered across reloads.
 async function loadTokens(): Promise<{ access: string | null; refresh: string | null }> {
-  const store = await secureStore();
-  const [access, refresh] = await Promise.all([
-    store.getItemAsync(TOKEN_KEY_ACCESS),
-    store.getItemAsync(TOKEN_KEY_REFRESH),
-  ]);
-  return { access, refresh };
+  try {
+    const store = await secureStore();
+    const [access, refresh] = await Promise.all([
+      store.getItemAsync(TOKEN_KEY_ACCESS),
+      store.getItemAsync(TOKEN_KEY_REFRESH),
+    ]);
+    return { access, refresh };
+  } catch {
+    return { access: null, refresh: null };
+  }
 }
 
 async function saveTokens(access: string, refresh: string): Promise<void> {
-  const store = await secureStore();
-  await Promise.all([
-    store.setItemAsync(TOKEN_KEY_ACCESS, access),
-    store.setItemAsync(TOKEN_KEY_REFRESH, refresh),
-  ]);
+  try {
+    const store = await secureStore();
+    await Promise.all([
+      store.setItemAsync(TOKEN_KEY_ACCESS, access),
+      store.setItemAsync(TOKEN_KEY_REFRESH, refresh),
+    ]);
+  } catch {
+    /* web / no secure store — session not persisted */
+  }
 }
 
 async function clearTokens(): Promise<void> {
-  const store = await secureStore();
-  await Promise.all([
-    store.deleteItemAsync(TOKEN_KEY_ACCESS),
-    store.deleteItemAsync(TOKEN_KEY_REFRESH),
-  ]);
+  try {
+    const store = await secureStore();
+    await Promise.all([
+      store.deleteItemAsync(TOKEN_KEY_ACCESS),
+      store.deleteItemAsync(TOKEN_KEY_REFRESH),
+    ]);
+  } catch {
+    /* ignore */
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +91,26 @@ const BACKOFF_FACTOR  = 2;
 
 function nextBackoff(current: number): number {
   return Math.min(current * BACKOFF_FACTOR, BACKOFF_MAX_MS);
+}
+
+// ---------------------------------------------------------------------------
+// URL helper
+// ---------------------------------------------------------------------------
+
+/**
+ * hostd serves the WebSocket at the /ws path. Users (and QR payloads) often
+ * give just ws://host:port, so append /ws when no path is present. Without this
+ * the socket connects to "/" — which hostd doesn't route — and fails with a
+ * bare "connection error".
+ */
+export function normalizeWsUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.pathname === '' || u.pathname === '/') u.pathname = '/ws';
+    return u.toString();
+  } catch {
+    return /\/ws\/?$/.test(url) ? url : url.replace(/\/+$/, '') + '/ws';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -97,12 +132,14 @@ export type ClientStatus =
 // Auth envelope data shapes (ctrl channel)
 // ---------------------------------------------------------------------------
 
+// NOTE: these field names mirror the Go server's ctrl payloads exactly
+// (internal/server/server.go). Do not rename without changing the server.
 interface PairRequest     { code: string }
-interface PairResponse    { access_token: string; refresh_token: string }
-interface AuthRequest     { access_token: string }
-interface AuthResponse    { ok: boolean }
-interface RefreshRequest  { refresh_token: string }
-interface RefreshResponse { access_token: string; refresh_token: string }
+interface PairResponse    { access: string; refresh: string }   // ctrl "paired"
+interface AuthRequest     { access: string }
+interface AuthResponse    { deviceId: string }                  // ctrl "ok"
+interface RefreshRequest  { refresh: string }
+interface RefreshResponse { access: string }                    // ctrl "refreshed" (access only)
 
 // ---------------------------------------------------------------------------
 // Client
@@ -142,7 +179,7 @@ export class Client {
    */
   async connect(url: string): Promise<void> {
     this.stopped = false;
-    this.url     = url;
+    this.url     = normalizeWsUrl(url);
     return this._openAndAuth();
   }
 
@@ -163,7 +200,7 @@ export class Client {
     const res = await this._request<PairRequest, PairResponse>(
       Ch.Ctrl, 'pair', { code },
     );
-    await saveTokens(res.access_token, res.refresh_token);
+    await saveTokens(res.access, res.refresh);
   }
 
   /**
@@ -172,7 +209,7 @@ export class Client {
    */
   async auth(accessToken: string): Promise<void> {
     await this._request<AuthRequest, AuthResponse>(
-      Ch.Ctrl, 'auth', { access_token: accessToken },
+      Ch.Ctrl, 'auth', { access: accessToken },
     );
   }
 
@@ -182,9 +219,11 @@ export class Client {
    */
   async refresh(refreshToken: string): Promise<void> {
     const res = await this._request<RefreshRequest, RefreshResponse>(
-      Ch.Ctrl, 'refresh', { refresh_token: refreshToken },
+      Ch.Ctrl, 'refresh', { refresh: refreshToken },
     );
-    await saveTokens(res.access_token, res.refresh_token);
+    // The server's "refresh" returns only a new access token; the refresh
+    // token is unchanged, so persist the new access alongside the same refresh.
+    await saveTokens(res.access, refreshToken);
   }
 
   /**
