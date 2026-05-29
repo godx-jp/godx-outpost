@@ -22,20 +22,70 @@ import {
 // Token storage (lazy Expo import)
 // ---------------------------------------------------------------------------
 
-interface SecureStore {
+interface KVStore {
   getItemAsync(key: string): Promise<string | null>;
   setItemAsync(key: string, value: string): Promise<void>;
   deleteItemAsync(key: string): Promise<void>;
 }
 
-let _store: SecureStore | null = null;
+let _store: KVStore | null = null;
 
-async function secureStore(): Promise<SecureStore> {
-  if (!_store) {
-    // Lazy import so this module can be imported in non-Expo environments.
-    _store = (await import('expo-secure-store')) as unknown as SecureStore;
+// fallbackStore persists via localStorage when available (web) and otherwise
+// keeps values in memory (last resort). Used when expo-secure-store is not
+// available — notably on web, where it isn't supported.
+function fallbackStore(): KVStore {
+  const ls =
+    typeof globalThis !== 'undefined' && (globalThis as { localStorage?: Storage }).localStorage
+      ? (globalThis as { localStorage: Storage }).localStorage
+      : null;
+  if (ls) {
+    return {
+      getItemAsync: async (k) => ls.getItem(k),
+      setItemAsync: async (k, v) => ls.setItem(k, v),
+      deleteItemAsync: async (k) => ls.removeItem(k),
+    };
   }
+  const mem = new Map<string, string>();
+  return {
+    getItemAsync: async (k) => mem.get(k) ?? null,
+    setItemAsync: async (k, v) => void mem.set(k, v),
+    deleteItemAsync: async (k) => void mem.delete(k),
+  };
+}
+
+async function secureStore(): Promise<KVStore> {
+  if (_store) return _store;
+  try {
+    const mod = (await import('expo-secure-store')) as unknown as KVStore & {
+      isAvailableAsync?: () => Promise<boolean>;
+    };
+    const available = mod.isAvailableAsync ? await mod.isAvailableAsync() : true;
+    if (available && typeof mod.getItemAsync === 'function') {
+      _store = mod;
+      return _store;
+    }
+  } catch {
+    /* fall through to fallback */
+  }
+  _store = fallbackStore();
   return _store;
+}
+
+/** Persisted convenience storage (host URL, last device) — same backend as tokens. */
+export async function storageGet(key: string): Promise<string | null> {
+  try {
+    return await (await secureStore()).getItemAsync(key);
+  } catch {
+    return null;
+  }
+}
+
+export async function storageSet(key: string, value: string): Promise<void> {
+  try {
+    await (await secureStore()).setItemAsync(key, value);
+  } catch {
+    /* best-effort */
+  }
 }
 
 const TOKEN_KEY_ACCESS  = 'rh_access_token';
@@ -165,6 +215,7 @@ export class Client {
   private backoffMs  = BACKOFF_BASE_MS;
   private stopped    = false;
   private _idCounter = 0;
+  private _authed    = false;
 
   // ---------------------------------------------------------------------------
   // Public API
@@ -183,9 +234,27 @@ export class Client {
     return this._openAndAuth();
   }
 
+  /**
+   * Resume a previously paired session: connect to url and authenticate using
+   * the stored access/refresh token. Returns true if we ended up authenticated
+   * (i.e. the host still trusts our token), false if there was no usable token
+   * (caller should show the pairing UI). Never throws on a missing token.
+   */
+  async resume(url: string): Promise<boolean> {
+    const { access, refresh } = await loadTokens();
+    if (!access && !refresh) return false;
+    try {
+      await this.connect(url);
+      return this._authed;
+    } catch {
+      return false;
+    }
+  }
+
   /** Disconnect permanently (suppresses auto-reconnect). */
   disconnect(): void {
     this.stopped = true;
+    this._authed = false;
     this._clearReconnect();
     this.ws?.close(1000, 'client disconnect');
     this.ws = null;
@@ -201,6 +270,7 @@ export class Client {
       Ch.Ctrl, 'pair', { code },
     );
     await saveTokens(res.access, res.refresh);
+    this._authed = true;
   }
 
   /**
@@ -263,10 +333,12 @@ export class Client {
     if (access) {
       try {
         await this.auth(access);
+        this._authed = true;
       } catch {
         if (refresh) {
           // refresh() saves the new tokens and the server considers us authed.
           await this.refresh(refresh);
+          this._authed = true;
         } else {
           await clearTokens();
           throw new Error('ws: auth failed and no refresh token available');
@@ -308,6 +380,7 @@ export class Client {
 
   private _handleClose(code: number, reason: string): void {
     this.ws = null;
+    this._authed = false;
     const err = new Error(`ws: closed (code=${code} reason=${reason || 'none'})`);
     for (const p of this.pending.values()) p.reject(err);
     this.pending.clear();
@@ -427,6 +500,11 @@ export class Client {
 
   get isConnected(): boolean {
     return this.status === 'connected';
+  }
+
+  /** True once pairing or token auth has succeeded on the current connection. */
+  get isAuthed(): boolean {
+    return this._authed;
   }
 }
 

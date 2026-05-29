@@ -9,8 +9,7 @@
  */
 
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import * as SecureStore from 'expo-secure-store';
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Platform,
@@ -20,7 +19,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { wsClient } from '../lib/ws';
+import { storageGet, storageSet, wsClient } from '../lib/ws';
 
 // SecureStore keys may only contain alphanumerics, ".", "-", "_" (no ":").
 const STORAGE_KEY = 'remote_host_last_pair';
@@ -32,6 +31,7 @@ interface QRPayload {
 }
 
 type Status =
+  | 'resuming'
   | 'idle'
   | 'manual'
   | 'scanning'
@@ -42,11 +42,37 @@ type Status =
 
 export default function PairScreen() {
   const [permission, requestPermission] = useCameraPermissions();
-  const [status, setStatus] = useState<Status>('idle');
+  // Start in 'resuming' while we check for a saved session.
+  const [status, setStatus] = useState<Status>('resuming');
   const [errorMsg, setErrorMsg] = useState('');
   const [manualUrl, setManualUrl] = useState(DEFAULT_URL);
   const [manualCode, setManualCode] = useState('');
   const scannedRef = useRef(false);
+
+  // On mount: if we paired before, reconnect with the stored token and skip
+  // straight to "paired" — no QR/code needed (this is the "remember me" path).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const raw = await storageGet(STORAGE_KEY);
+      if (!raw) {
+        if (!cancelled) setStatus('idle');
+        return;
+      }
+      let url = DEFAULT_URL;
+      try {
+        url = (JSON.parse(raw) as { url: string }).url || DEFAULT_URL;
+      } catch {
+        /* ignore malformed */
+      }
+      if (!cancelled) setManualUrl(url);
+      const ok = await wsClient.resume(url);
+      if (!cancelled) setStatus(ok ? 'paired' : 'idle');
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Shared pairing flow used by both QR scan and manual entry.
   const doPair = useCallback(async (url: string, code: string) => {
@@ -57,14 +83,9 @@ export default function PairScreen() {
       setStatus('pairing');
       await wsClient.pair(code);
 
-      // Remember the host for convenience — best-effort only: a storage failure
-      // (e.g. SecureStore unavailable on web) must not fail an otherwise-
-      // successful pairing.
-      try {
-        await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify({ url }));
-      } catch {
-        /* ignore — pairing already succeeded */
-      }
+      // Remember the host so next launch can auto-resume with the stored token.
+      // storageSet is best-effort and never throws.
+      await storageSet(STORAGE_KEY, JSON.stringify({ url }));
       setStatus('paired');
     } catch (e) {
       setErrorMsg((e as Error).message ?? 'Pairing failed');
@@ -111,6 +132,16 @@ export default function PairScreen() {
     setStatus('idle');
     setErrorMsg('');
   };
+
+  // ── Resuming: checking for a saved session
+  if (status === 'resuming') {
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator size="large" color="#4fc3f7" />
+        <Text style={[styles.label, { marginTop: 16 }]}>Restoring session…</Text>
+      </View>
+    );
+  }
 
   // ── Idle: choose how to pair
   if (status === 'idle') {
