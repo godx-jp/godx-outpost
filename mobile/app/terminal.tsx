@@ -20,10 +20,10 @@
 import { useFocusEffect } from 'expo-router';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, StyleSheet, View } from 'react-native';
-import { Appbar, Button, Divider, IconButton, List, Text } from 'react-native-paper';
+import { Appbar, Button, Divider, IconButton, List, Menu, Text } from 'react-native-paper';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import { BinaryKind, Ch, type Envelope } from '../lib/protocol';
-import { takeTermLaunch } from '../lib/termLaunch';
+import { TMUX_NEW_CMD, takeTermLaunch, tmuxAttachCmd } from '../lib/termLaunch';
 import { TermToolbar } from '../lib/TermToolbar';
 import { useAuthed } from '../lib/useConn';
 import { wsClient } from '../lib/ws';
@@ -44,6 +44,10 @@ function shellQuote(p: string): string {
 
 interface SessionInfo {
   id: string; title: string; cols: number; rows: number; alive: boolean; created: number;
+}
+
+interface TmuxInfo {
+  name: string; windows: number; attached: boolean;
 }
 
 const TERMINAL_HTML = `<!DOCTYPE html>
@@ -122,6 +126,8 @@ const TERMINAL_HTML = `<!DOCTYPE html>
 export default function TerminalScreen() {
   const [view, setView]           = useState<'list' | 'term'>('list');
   const [sessions, setSessions]   = useState<SessionInfo[]>([]);
+  const [tmux, setTmux]           = useState<{ available: boolean; sessions: TmuxInfo[] }>({ available: false, sessions: [] });
+  const [newMenu, setNewMenu]     = useState(false);
   const [activeId, setActiveId]   = useState<string | null>(null);
   const [creating, setCreating]   = useState(false);
   const [landscape, setLandscape] = useState(false);
@@ -151,7 +157,9 @@ export default function TerminalScreen() {
   const createSessionRef = useRef<(() => void) | null>(null);
 
   const refreshList = useCallback(() => {
-    if (wsClient.isConnected) wsClient.send({ ch: Ch.Term, type: 'list' });
+    if (!wsClient.isConnected) return;
+    wsClient.send({ ch: Ch.Term, type: 'list' });
+    wsClient.send({ ch: Ch.Term, type: 'list-tmux' });
   }, []);
 
   // Toggle forced landscape (wider terminal) vs free orientation. expo-screen-
@@ -212,6 +220,9 @@ export default function TerminalScreen() {
       switch (env.type) {
         case 'list':
           setSessions((d.sessions ?? []) as SessionInfo[]);
+          break;
+        case 'list-tmux':
+          setTmux({ available: !!d.available, sessions: (d.sessions ?? []) as TmuxInfo[] });
           break;
         case 'created':
           // New session created on host → open it.
@@ -317,6 +328,13 @@ export default function TerminalScreen() {
     // activeId/view set when "created" arrives.
   };
   createSessionRef.current = createSession;
+
+  // Create a fresh hostd session and, once attached, run a command in it
+  // (reuses the launch-command injection used by Files long-press).
+  const createWithCmd = (cmd: string) => {
+    launchCmdRef.current = cmd;
+    createSession();
+  };
 
   const openSession = (id: string) => {
     setActiveId(id);
@@ -497,36 +515,78 @@ export default function TerminalScreen() {
         <Appbar.Action icon="refresh" onPress={refreshList} />
       </Appbar.Header>
 
-      <Button
-        mode="contained"
-        icon="plus"
-        onPress={createSession}
-        loading={creating}
-        disabled={creating}
-        style={styles.newBtn}
-      >
-        {creating ? 'Creating…' : 'New Session'}
-      </Button>
+      {tmux.available ? (
+        <Menu
+          visible={newMenu}
+          onDismiss={() => setNewMenu(false)}
+          anchor={
+            <Button
+              mode="contained"
+              icon="plus"
+              onPress={() => setNewMenu(true)}
+              loading={creating}
+              disabled={creating}
+              style={styles.newBtn}
+            >
+              {creating ? 'Creating…' : 'New Session'}
+            </Button>
+          }
+        >
+          <Menu.Item
+            leadingIcon="console-line"
+            title="Shell session"
+            onPress={() => { setNewMenu(false); createSession(); }}
+          />
+          <Menu.Item
+            leadingIcon="view-grid-outline"
+            title="tmux session"
+            onPress={() => { setNewMenu(false); createWithCmd(TMUX_NEW_CMD); }}
+          />
+        </Menu>
+      ) : (
+        <Button
+          mode="contained"
+          icon="plus"
+          onPress={createSession}
+          loading={creating}
+          disabled={creating}
+          style={styles.newBtn}
+        >
+          {creating ? 'Creating…' : 'New Session'}
+        </Button>
+      )}
 
       <FlatList
-        data={sessions}
-        keyExtractor={(s) => s.id}
+        data={[
+          ...tmux.sessions.map((t) => ({ kind: 'tmux' as const, t })),
+          ...sessions.map((s) => ({ kind: 'host' as const, s })),
+        ]}
+        keyExtractor={(row) => (row.kind === 'tmux' ? `tmux:${row.t.name}` : `host:${row.s.id}`)}
         ListEmptyComponent={
           <Text variant="bodyMedium" style={styles.empty}>No sessions yet. Tap “New Session”.</Text>
         }
         ItemSeparatorComponent={Divider}
-        renderItem={({ item }) => (
-          <List.Item
-            title={item.title}
-            description={`${item.id} · ${item.cols}×${item.rows}${item.alive ? '' : ' · exited'}`}
-            descriptionStyle={styles.mono}
-            onPress={() => openSession(item.id)}
-            left={(props) => <List.Icon {...props} icon="console-line" />}
-            right={(props) => (
-              <IconButton {...props} icon="trash-can-outline" onPress={() => killSession(item.id)} />
-            )}
-          />
-        )}
+        renderItem={({ item }) =>
+          item.kind === 'tmux' ? (
+            <List.Item
+              title={item.t.name}
+              description={`tmux · ${item.t.windows} window${item.t.windows === 1 ? '' : 's'}${item.t.attached ? ' · attached' : ''}`}
+              onPress={() => createWithCmd(tmuxAttachCmd(item.t.name))}
+              left={(props) => <List.Icon {...props} icon="view-grid-outline" />}
+            />
+          ) : (
+            <List.Item
+              title={item.s.title}
+              description={`${item.s.id} · ${item.s.cols}×${item.s.rows}${item.s.alive ? '' : ' · exited'}`}
+              descriptionStyle={styles.mono}
+              onPress={() => openSession(item.s.id)}
+              left={(props) => <List.Icon {...props} icon="console-line" />}
+              right={(props) => (
+                <IconButton {...props} icon="trash-can-outline" onPress={() => killSession(item.s.id)} />
+              )}
+            />
+          )
+        }
       />
     </View>
   );

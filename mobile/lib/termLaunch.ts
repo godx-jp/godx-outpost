@@ -46,6 +46,14 @@ export function cdCommand(path: string): string {
   return `cd ${shellQuote(path)}`;
 }
 
+/** Command to create (and attach) a fresh tmux session. */
+export const TMUX_NEW_CMD = 'tmux new-session';
+
+/** Command to attach to an existing tmux session by name. */
+export function tmuxAttachCmd(name: string): string {
+  return `tmux attach -t ${shellQuote(name)}`;
+}
+
 /** Build the full shell command for a long-press launch option. */
 export function buildLaunchCmd(path: string, kind: LaunchKind): string {
   const cd = cdCommand(path);

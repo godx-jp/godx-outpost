@@ -45,6 +45,8 @@ const UP = [0x1b, 0x5b, 0x41];
 const DOWN = [0x1b, 0x5b, 0x42];
 const RIGHT = [0x1b, 0x5b, 0x43];
 const LEFT = [0x1b, 0x5b, 0x44];
+const PGUP = [0x1b, 0x5b, 0x35, 0x7e];   // ESC [ 5 ~  — page up (scroll TUIs like claude/less)
+const PGDN = [0x1b, 0x5b, 0x36, 0x7e];   // ESC [ 6 ~  — page down
 const CR = 0x0d;
 
 function strBytes(s: string): number[] {
@@ -154,6 +156,13 @@ export function TermToolbar({ onKey }: { onKey: (bytes: number[]) => void }) {
               <Pressable style={[styles.dkey, styles.dDown]} onPress={() => onKey(DOWN)}>
                 <MaterialCommunityIcons name="chevron-down" size={26} color="#e0e0e0" />
               </Pressable>
+              {/* Page Up / Page Down in the free corners — scroll full-screen apps. */}
+              <Pressable style={[styles.dkey, styles.dPgUp]} onPress={() => onKey(PGUP)}>
+                <MaterialCommunityIcons name="chevron-double-up" size={24} color="#4fc3f7" />
+              </Pressable>
+              <Pressable style={[styles.dkey, styles.dPgDn]} onPress={() => onKey(PGDN)}>
+                <MaterialCommunityIcons name="chevron-double-down" size={24} color="#4fc3f7" />
+              </Pressable>
             </View>
           ) : null}
         </>
@@ -198,4 +207,6 @@ const styles = StyleSheet.create({
   dLeft: { left: 0, top: 47 },
   dRight: { right: 0, top: 47 },
   dCenter: { top: 47, left: 47, backgroundColor: '#3a3a3a' },
+  dPgUp: { top: 0, left: 94 },     // top-right corner
+  dPgDn: { bottom: 0, left: 94 },  // bottom-right corner
 });

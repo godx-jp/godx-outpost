@@ -96,6 +96,8 @@ func (h *Handler) Handle(_ context.Context, e protocol.Envelope, c channel.Conn)
 	switch e.Type {
 	case "list":
 		return h.list(e, c)
+	case "list-tmux":
+		return h.listTmux(e, c)
 	case "create":
 		return h.create(e, c)
 	case "attach":
@@ -114,6 +116,17 @@ func (h *Handler) Handle(_ context.Context, e protocol.Envelope, c channel.Conn)
 func (h *Handler) list(e protocol.Envelope, c channel.Conn) error {
 	env, err := protocol.NewEnvelope(protocol.ChTerm, "list", e.ID,
 		map[string]any{"sessions": h.mgr.List()})
+	if err != nil {
+		return err
+	}
+	return c.Send(env)
+}
+
+// listTmux reports the host's tmux sessions plus whether tmux is installed (so
+// the client can offer a "new tmux session" option only when available).
+func (h *Handler) listTmux(e protocol.Envelope, c channel.Conn) error {
+	env, err := protocol.NewEnvelope(protocol.ChTerm, "list-tmux", e.ID,
+		map[string]any{"available": TmuxAvailable(), "sessions": ListTmux()})
 	if err != nil {
 		return err
 	}
