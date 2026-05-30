@@ -10,10 +10,14 @@
 		13B07FBC1A68108700A75B9A /* AppDelegate.mm in Sources */ = {isa = PBXBuildFile; fileRef = 13B07FB01A68108700A75B9A /* AppDelegate.mm */; };
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
 		13B07FC11A68108700A75B9A /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 13B07FB71A68108700A75B9A /* main.m */; };
+		2E677D7076F1B5CAE156F39E /* RemoteTerminalViewManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2986D009CAE7DDDA6E43BA3 /* RemoteTerminalViewManager.swift */; };
 		3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */; };
+		511B695B3E0E167F1B6A5757 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = 71341F0CD7996B7713037A0E /* SwiftTerm */; };
+		96198DB4A490353E1C0B066A /* RemoteTerminalViewManager.m in Sources */ = {isa = PBXBuildFile; fileRef = 143E04F37B557BA3E9DCB830 /* RemoteTerminalViewManager.m */; };
 		96905EF65AED1B983A6B3ABC /* libPods-remotehost.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 58EEBF8E8E6FB1BC6CAF49B5 /* libPods-remotehost.a */; };
 		B18059E884C0ABDD17F3DC3D /* ExpoModulesProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC715A2D49A985799AEE119 /* ExpoModulesProvider.swift */; };
 		BB2F792D24A3F905000567C9 /* Expo.plist in Resources */ = {isa = PBXBuildFile; fileRef = BB2F792C24A3F905000567C9 /* Expo.plist */; };
+		BF64AE493734E29356507970 /* RemoteTerminalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72176DD4049FAB43B8A37698 /* RemoteTerminalView.swift */; };
 		C90D976F5E39032664BA7B56 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = F9497CF4D63C845981460AB3 /* PrivacyInfo.xcprivacy */; };
 		CC381FB6DCCD4DD7AE0A6159 /* noop-file.swift in Sources */ = {isa = PBXBuildFile; fileRef = D247D98FD3044BCFACDC78EE /* noop-file.swift */; };
 /* End PBXBuildFile section */
@@ -25,12 +29,15 @@
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = remotehost/Images.xcassets; sourceTree = "<group>"; };
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = remotehost/Info.plist; sourceTree = "<group>"; };
 		13B07FB71A68108700A75B9A /* main.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; name = main.m; path = remotehost/main.m; sourceTree = "<group>"; };
+		143E04F37B557BA3E9DCB830 /* RemoteTerminalViewManager.m */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.objc; name = RemoteTerminalViewManager.m; path = remotehost/RemoteTerminalViewManager.m; sourceTree = "<group>"; };
 		58EEBF8E8E6FB1BC6CAF49B5 /* libPods-remotehost.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-remotehost.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 		6C2E3173556A471DD304B334 /* Pods-remotehost.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-remotehost.debug.xcconfig"; path = "Target Support Files/Pods-remotehost/Pods-remotehost.debug.xcconfig"; sourceTree = "<group>"; };
+		72176DD4049FAB43B8A37698 /* RemoteTerminalView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = RemoteTerminalView.swift; path = remotehost/RemoteTerminalView.swift; sourceTree = "<group>"; };
 		7A4D352CD337FB3A3BF06240 /* Pods-remotehost.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-remotehost.release.xcconfig"; path = "Target Support Files/Pods-remotehost/Pods-remotehost.release.xcconfig"; sourceTree = "<group>"; };
 		AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = SplashScreen.storyboard; path = remotehost/SplashScreen.storyboard; sourceTree = "<group>"; };
 		BB2F792C24A3F905000567C9 /* Expo.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Expo.plist; sourceTree = "<group>"; };
 		D247D98FD3044BCFACDC78EE /* noop-file.swift */ = {isa = PBXFileReference; explicitFileType = undefined; fileEncoding = 4; includeInIndex = 0; lastKnownFileType = sourcecode.swift; name = "noop-file.swift"; path = "remotehost/noop-file.swift"; sourceTree = "<group>"; };
+		D2986D009CAE7DDDA6E43BA3 /* RemoteTerminalViewManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = RemoteTerminalViewManager.swift; path = remotehost/RemoteTerminalViewManager.swift; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 		F9497CF4D63C845981460AB3 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xml; name = PrivacyInfo.xcprivacy; path = remotehost/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		FABB57EE46B74F02B7C44798 /* remotehost-Bridging-Header.h */ = {isa = PBXFileReference; explicitFileType = undefined; fileEncoding = 4; includeInIndex = 0; lastKnownFileType = sourcecode.c.h; name = "remotehost-Bridging-Header.h"; path = "remotehost/remotehost-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -43,6 +50,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				96905EF65AED1B983A6B3ABC /* libPods-remotehost.a in Frameworks */,
+				511B695B3E0E167F1B6A5757 /* SwiftTerm in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -62,6 +70,9 @@
 				D247D98FD3044BCFACDC78EE /* noop-file.swift */,
 				FABB57EE46B74F02B7C44798 /* remotehost-Bridging-Header.h */,
 				F9497CF4D63C845981460AB3 /* PrivacyInfo.xcprivacy */,
+				72176DD4049FAB43B8A37698 /* RemoteTerminalView.swift */,
+				D2986D009CAE7DDDA6E43BA3 /* RemoteTerminalViewManager.swift */,
+				143E04F37B557BA3E9DCB830 /* RemoteTerminalViewManager.m */,
 			);
 			name = remotehost;
 			sourceTree = "<group>";
@@ -160,6 +171,9 @@
 			dependencies = (
 			);
 			name = remotehost;
+			packageProductDependencies = (
+				71341F0CD7996B7713037A0E /* SwiftTerm */,
+			);
 			productName = remotehost;
 			productReference = 13B07F961A680F5B00A75B9A /* remotehost.app */;
 			productType = "com.apple.product-type.application";
@@ -186,6 +200,9 @@
 				Base,
 			);
 			mainGroup = 83CBB9F61A601CBA00E9B192;
+			packageReferences = (
+				CDDDE0039ABA705A18CFD057 /* XCRemoteSwiftPackageReference "SwiftTerm" */,
+			);
 			productRefGroup = 83CBBA001A601CBA00E9B192 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -329,6 +346,9 @@
 				13B07FC11A68108700A75B9A /* main.m in Sources */,
 				B18059E884C0ABDD17F3DC3D /* ExpoModulesProvider.swift in Sources */,
 				CC381FB6DCCD4DD7AE0A6159 /* noop-file.swift in Sources */,
+				BF64AE493734E29356507970 /* RemoteTerminalView.swift in Sources */,
+				2E677D7076F1B5CAE156F39E /* RemoteTerminalViewManager.swift in Sources */,
+				96198DB4A490353E1C0B066A /* RemoteTerminalViewManager.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -549,6 +569,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		CDDDE0039ABA705A18CFD057 /* XCRemoteSwiftPackageReference "SwiftTerm" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/migueldeicaza/SwiftTerm";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.13.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		71341F0CD7996B7713037A0E /* SwiftTerm */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CDDDE0039ABA705A18CFD057 /* XCRemoteSwiftPackageReference "SwiftTerm" */;
+			productName = SwiftTerm;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 83CBB9F71A601CBA00E9B192 /* Project object */;
 }

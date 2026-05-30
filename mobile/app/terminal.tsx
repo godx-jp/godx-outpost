@@ -19,11 +19,22 @@
 
 import { useFocusEffect } from 'expo-router';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, FlatList, StyleSheet, View } from 'react-native';
-import { Appbar, Button, Divider, IconButton, List, Menu, Text } from 'react-native-paper';
+import { ActivityIndicator, Alert, FlatList, findNodeHandle, Platform, StyleSheet, View } from 'react-native';
+import {
+  Appbar, Button, Dialog, Divider, IconButton, List, Menu, Portal, Text, TextInput,
+  useTheme,
+} from 'react-native-paper';
+import { type AppTheme } from '../lib/theme';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
+import {
+  feedTerminal,
+  focusTerminal,
+  RemoteTerminalView,
+  type TermDataEvent,
+  type TermSizeEvent,
+} from '../lib/NativeTerminal';
 import { BinaryKind, Ch, type Envelope } from '../lib/protocol';
-import { TMUX_NEW_CMD, takeTermLaunch, tmuxAttachCmd } from '../lib/termLaunch';
+import { takeTermLaunch } from '../lib/termLaunch';
 import { TermToolbar } from '../lib/TermToolbar';
 import { useAuthed } from '../lib/useConn';
 import { wsClient } from '../lib/ws';
@@ -46,8 +57,48 @@ interface SessionInfo {
   id: string; title: string; cols: number; rows: number; alive: boolean; created: number;
 }
 
-interface TmuxInfo {
-  name: string; windows: number; attached: boolean;
+// A multiplexer (tmux/zellij) session. windows/attached are tmux-only extras.
+interface MuxInfo { name: string; windows?: number; attached?: boolean }
+interface MuxState { available: boolean; sessions: MuxInfo[] }
+type MuxTool = 'tmux' | 'zellij';
+type CreateKind = 'shell' | MuxTool;
+type ConfirmKill =
+  | { kind: 'host'; id: string; label: string }
+  | { kind: MuxTool; name: string };
+
+// Per-tool UI metadata.
+const MUX = {
+  tmux:   { label: 'tmux',   icon: 'view-grid-outline' },
+  zellij: { label: 'zellij', icon: 'view-dashboard-outline' },
+} as const;
+
+// Fruit names used when the user leaves the session name blank.
+const FRUITS = [
+  'mango', 'papaya', 'lychee', 'durian', 'guava', 'rambutan', 'longan', 'pomelo',
+  'jackfruit', 'dragonfruit', 'passion', 'coconut', 'banana', 'mangosteen',
+  'starfruit', 'tamarind', 'persimmon', 'plum', 'peach', 'apricot', 'cherry',
+  'melon', 'lime', 'pomegranate', 'fig', 'kiwi', 'grape', 'apple', 'pear', 'lemon',
+];
+
+/** A fruit name not already taken (falls back to a numbered suffix). */
+function randomFruit(taken: Set<string>): string {
+  const free = FRUITS.filter((f) => !taken.has(f));
+  if (free.length > 0) return free[Math.floor(Math.random() * free.length)];
+  for (let i = 2; ; i++) {
+    for (const f of FRUITS) {
+      const n = `${f}-${i}`;
+      if (!taken.has(n)) return n;
+    }
+  }
+}
+
+/** Ensure base is unique among taken by appending -2, -3, … */
+function uniqueName(base: string, taken: Set<string>): string {
+  if (!taken.has(base)) return base;
+  for (let i = 2; ; i++) {
+    const n = `${base}-${i}`;
+    if (!taken.has(n)) return n;
+  }
 }
 
 const TERMINAL_HTML = `<!DOCTYPE html>
@@ -126,15 +177,27 @@ const TERMINAL_HTML = `<!DOCTYPE html>
 export default function TerminalScreen() {
   const [view, setView]           = useState<'list' | 'term'>('list');
   const [sessions, setSessions]   = useState<SessionInfo[]>([]);
-  const [tmux, setTmux]           = useState<{ available: boolean; sessions: TmuxInfo[] }>({ available: false, sessions: [] });
+  const [tmux, setTmux]           = useState<MuxState>({ available: false, sessions: [] });
+  const [zellij, setZellij]       = useState<MuxState>({ available: false, sessions: [] });
   const [newMenu, setNewMenu]     = useState(false);
+  // Name-prompt dialog shown before creating a session (null = closed).
+  const [nameKind, setNameKind]   = useState<null | CreateKind>(null);
+  const [nameInput, setNameInput] = useState('');
+  // Kill-confirmation dialog target (null = closed).
+  const [confirmKill, setConfirmKill] = useState<ConfirmKill | null>(null);
+  const theme = useTheme<AppTheme>();
   const [activeId, setActiveId]   = useState<string | null>(null);
   const [creating, setCreating]   = useState(false);
   const [landscape, setLandscape] = useState(false);
   const [uploading, setUploading] = useState(false);
   const authed = useAuthed();
 
+  // iOS uses the native SwiftTerm view (real IME / Vietnamese, native scroll);
+  // web/Android fall back to the xterm.js WebView.
+  const useNativeTerm = Platform.OS === 'ios';
   const webviewRef = useRef<WebView>(null);
+  const nativeRef = useRef<any>(null);
+  const nativeTagRef = useRef<number | null>(null);
   const activeIdRef = useRef<string | null>(null);
   activeIdRef.current = activeId;
   const creatingRef = useRef(false);
@@ -160,6 +223,7 @@ export default function TerminalScreen() {
     if (!wsClient.isConnected) return;
     wsClient.send({ ch: Ch.Term, type: 'list' });
     wsClient.send({ ch: Ch.Term, type: 'list-tmux' });
+    wsClient.send({ ch: Ch.Term, type: 'list-zellij' });
   }, []);
 
   // Toggle forced landscape (wider terminal) vs free orientation. expo-screen-
@@ -222,7 +286,10 @@ export default function TerminalScreen() {
           setSessions((d.sessions ?? []) as SessionInfo[]);
           break;
         case 'list-tmux':
-          setTmux({ available: !!d.available, sessions: (d.sessions ?? []) as TmuxInfo[] });
+          setTmux({ available: !!d.available, sessions: (d.sessions ?? []) as MuxInfo[] });
+          break;
+        case 'list-zellij':
+          setZellij({ available: !!d.available, sessions: (d.sessions ?? []) as MuxInfo[] });
           break;
         case 'created':
           // New session created on host → open it.
@@ -270,12 +337,17 @@ export default function TerminalScreen() {
         bin += String.fromCharCode.apply(null, Array.from(merged.subarray(i, i + 0x8000)));
       }
       const b64 = btoa(bin);
-      // Guard __termWrite: a frame can arrive in the brief window before the
-      // WebView has loaded xterm.js and defined the function. Skipping it then
-      // is safe — attach() replays scrollback once the WebView is ready.
-      webviewRef.current?.injectJavaScript(
-        `if(window.__termWrite){window.__termWrite(${JSON.stringify(b64)});}true;`
-      );
+      if (useNativeTerm) {
+        // Native SwiftTerm view: feed bytes straight in (no WebView bridge).
+        feedTerminal(nativeTagRef.current, b64);
+      } else {
+        // Guard __termWrite: a frame can arrive in the brief window before the
+        // WebView has loaded xterm.js and defined the function. Skipping it then
+        // is safe — attach() replays scrollback once the WebView is ready.
+        webviewRef.current?.injectJavaScript(
+          `if(window.__termWrite){window.__termWrite(${JSON.stringify(b64)});}true;`
+        );
+      }
     };
 
     const prevBin = wsClient.onBinary;
@@ -304,14 +376,14 @@ export default function TerminalScreen() {
     };
   }, [authed, refreshList]);
 
-  const createSession = () => {
+  const createSession = (title?: string) => {
     if (!wsClient.isAuthed) {
       wsClient.onError?.('Not connected to a host — open the Hosts tab and connect first.');
       return;
     }
     setCreating(true);
     try {
-      wsClient.send({ ch: Ch.Term, type: 'create', data: { cols: 80, rows: 24 } });
+      wsClient.send({ ch: Ch.Term, type: 'create', data: { cols: 80, rows: 24, ...(title ? { title } : {}) } });
     } catch (e) {
       setCreating(false);
       wsClient.onError?.(`Could not create session: ${(e as Error).message}`);
@@ -331,9 +403,32 @@ export default function TerminalScreen() {
 
   // Create a fresh hostd session and, once attached, run a command in it
   // (reuses the launch-command injection used by Files long-press).
-  const createWithCmd = (cmd: string) => {
+  const createWithCmd = (cmd: string, title?: string) => {
     launchCmdRef.current = cmd;
-    createSession();
+    createSession(title);
+  };
+
+  // Confirm the name dialog: resolve a unique name (random fruit if blank) and
+  // create the requested kind of session.
+  const confirmCreate = () => {
+    const kind = nameKind;
+    if (!kind) return;
+    const taken = new Set<string>([
+      ...sessions.map((s) => s.title),
+      ...tmux.sessions.map((t) => t.name),
+      ...zellij.sessions.map((z) => z.name),
+    ]);
+    const base = nameInput.trim() || randomFruit(taken);
+    const name = uniqueName(base, taken);
+    setNameKind(null);
+    setNameInput('');
+    if (kind === 'tmux') {
+      createWithCmd(`tmux new-session -s ${shellQuote(name)}`, name);
+    } else if (kind === 'zellij') {
+      createWithCmd(`zellij attach --create ${shellQuote(name)}`, name);
+    } else {
+      createSession(name);
+    }
   };
 
   const openSession = (id: string) => {
@@ -342,8 +437,31 @@ export default function TerminalScreen() {
     // attach is sent once the WebView signals 'ready'.
   };
 
+  // Open (attach to) an existing multiplexer session in a fresh hostd session.
+  const openMux = (tool: MuxTool, name: string) => {
+    const cmd = tool === 'tmux'
+      ? `tmux attach -t ${shellQuote(name)}`
+      : `zellij attach ${shellQuote(name)}`;
+    createWithCmd(cmd, name);
+  };
+
   const killSession = (id: string) => {
     wsClient.send({ ch: Ch.Term, type: 'kill', data: { sessionId: id } });
+  };
+
+  // Kill a tmux/zellij session on the host.
+  const muxKill = (tool: MuxTool, name: string) => {
+    wsClient.send({ ch: Ch.Term, type: 'mux-kill', data: { tool, name } });
+    setTimeout(refreshList, 400);
+  };
+
+  // Execute the pending kill after the confirmation dialog.
+  const doConfirmKill = () => {
+    const target = confirmKill;
+    setConfirmKill(null);
+    if (!target) return;
+    if (target.kind === 'host') killSession(target.id);
+    else muxKill(target.kind, target.name);
   };
 
   const leaveToList = () => {
@@ -362,10 +480,14 @@ export default function TerminalScreen() {
     const id = activeIdRef.current;
     if (!id) return;
     wsClient.sendBinary({ kind: BinaryKind.TermInput, streamID: id, payload: new Uint8Array(bytes) });
-    webviewRef.current?.injectJavaScript(
-      "var t=document.querySelector('.xterm-helper-textarea'); if(t)t.focus(); true;",
-    );
-  }, []);
+    if (useNativeTerm) {
+      focusTerminal(nativeTagRef.current);
+    } else {
+      webviewRef.current?.injectJavaScript(
+        "var t=document.querySelector('.xterm-helper-textarea'); if(t)t.focus(); true;",
+      );
+    }
+  }, [useNativeTerm]);
 
   // Upload a base64 blob to the host, then type its returned host path into the
   // active session (shell-quoted, no Enter) so the user can finish the command —
@@ -430,6 +552,48 @@ export default function TerminalScreen() {
     ]);
   }, [uploading, pickImage, pickFile]);
 
+  // Attach to the active session once the terminal surface is ready (shared by
+  // the WebView 'ready' message and the native onReady event). Scrollback
+  // replays into the view; a Files-launched command is typed once it settles.
+  const attachActive = useCallback(() => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    wsClient.send({
+      ch: Ch.Term, type: 'attach',
+      data: { sessionId: id, cols: lastSizeRef.current.cols, rows: lastSizeRef.current.rows },
+    });
+    const init = initCmdsRef.current[id];
+    if (init) {
+      delete initCmdsRef.current[id];
+      setTimeout(() => {
+        wsClient.sendBinary({
+          kind: BinaryKind.TermInput, streamID: id, payload: utf8Bytes(`${init}\r`),
+        });
+      }, 450);
+    }
+  }, []);
+
+  const onTermResize = useCallback((cols: number, rows: number) => {
+    const id = activeIdRef.current;
+    if (!id || !cols || !rows) return;
+    lastSizeRef.current = { cols, rows };
+    wsClient.send({ ch: Ch.Term, type: 'resize', data: { sessionId: id, cols, rows } });
+  }, []);
+
+  // Native SwiftTerm events (iOS).
+  const onNativeData = useCallback((e: TermDataEvent) => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    const bin = atob(e.nativeEvent.base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    wsClient.sendBinary({ kind: BinaryKind.TermInput, streamID: id, payload: bytes });
+  }, []);
+
+  const onNativeSize = useCallback((e: TermSizeEvent) => {
+    onTermResize(e.nativeEvent.cols, e.nativeEvent.rows);
+  }, [onTermResize]);
+
   const handleWebViewMessage = (event: WebViewMessageEvent) => {
     let msg: { type: string; data?: string; cols?: number; rows?: number };
     try { msg = JSON.parse(event.nativeEvent.data); } catch { return; }
@@ -437,29 +601,14 @@ export default function TerminalScreen() {
     if (!id) return;
 
     if (msg.type === 'ready') {
-      // Attach now that xterm exists; scrollback replays into it.
-      wsClient.send({
-        ch: Ch.Term, type: 'attach',
-        data: { sessionId: id, cols: lastSizeRef.current.cols, rows: lastSizeRef.current.rows },
-      });
-      // If launched from Files, type the queued command once the shell settles.
-      const init = initCmdsRef.current[id];
-      if (init) {
-        delete initCmdsRef.current[id];
-        setTimeout(() => {
-          wsClient.sendBinary({
-            kind: BinaryKind.TermInput, streamID: id, payload: utf8Bytes(`${init}\r`),
-          });
-        }, 450);
-      }
+      attachActive();
     } else if (msg.type === 'term/input' && msg.data) {
       const bin = atob(msg.data);
       const bytes = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
       wsClient.sendBinary({ kind: BinaryKind.TermInput, streamID: id, payload: bytes });
     } else if (msg.type === 'term/resize' && msg.cols && msg.rows) {
-      lastSizeRef.current = { cols: msg.cols, rows: msg.rows };
-      wsClient.send({ ch: Ch.Term, type: 'resize', data: { sessionId: id, cols: msg.cols, rows: msg.rows } });
+      onTermResize(msg.cols, msg.rows);
     }
   };
 
@@ -489,19 +638,33 @@ export default function TerminalScreen() {
           />
           <Appbar.Action icon="trash-can-outline" onPress={() => killSession(activeId)} />
         </Appbar.Header>
-        <WebView
-          key={activeId}            /* fresh xterm per session */
-          ref={webviewRef}
-          source={{ html: TERMINAL_HTML }}
-          style={styles.webview}
-          onMessage={handleWebViewMessage}
-          originWhitelist={['*']}
-          keyboardDisplayRequiresUserAction={false}
-          automaticallyAdjustContentInsets={false}
-          contentInsetAdjustmentBehavior="never"
-          decelerationRate="normal"
-          overScrollMode="never"
-        />
+        {useNativeTerm ? (
+          <RemoteTerminalView
+            key={activeId}            /* fresh terminal per session */
+            ref={(r: any) => {
+              nativeRef.current = r;
+              nativeTagRef.current = r ? findNodeHandle(r) : null;
+            }}
+            style={styles.webview}
+            onReady={attachActive}
+            onData={onNativeData}
+            onSizeChange={onNativeSize}
+          />
+        ) : (
+          <WebView
+            key={activeId}            /* fresh xterm per session */
+            ref={webviewRef}
+            source={{ html: TERMINAL_HTML }}
+            style={styles.webview}
+            onMessage={handleWebViewMessage}
+            originWhitelist={['*']}
+            keyboardDisplayRequiresUserAction={false}
+            automaticallyAdjustContentInsets={false}
+            contentInsetAdjustmentBehavior="never"
+            decelerationRate="normal"
+            overScrollMode="never"
+          />
+        )}
         <TermToolbar onKey={sendKeys} />
       </View>
     );
@@ -515,7 +678,7 @@ export default function TerminalScreen() {
         <Appbar.Action icon="refresh" onPress={refreshList} />
       </Appbar.Header>
 
-      {tmux.available ? (
+      {tmux.available || zellij.available ? (
         <Menu
           visible={newMenu}
           onDismiss={() => setNewMenu(false)}
@@ -535,19 +698,28 @@ export default function TerminalScreen() {
           <Menu.Item
             leadingIcon="console-line"
             title="Shell session"
-            onPress={() => { setNewMenu(false); createSession(); }}
+            onPress={() => { setNewMenu(false); setNameInput(''); setNameKind('shell'); }}
           />
-          <Menu.Item
-            leadingIcon="view-grid-outline"
-            title="tmux session"
-            onPress={() => { setNewMenu(false); createWithCmd(TMUX_NEW_CMD); }}
-          />
+          {tmux.available ? (
+            <Menu.Item
+              leadingIcon={MUX.tmux.icon}
+              title="tmux session"
+              onPress={() => { setNewMenu(false); setNameInput(''); setNameKind('tmux'); }}
+            />
+          ) : null}
+          {zellij.available ? (
+            <Menu.Item
+              leadingIcon={MUX.zellij.icon}
+              title="zellij session"
+              onPress={() => { setNewMenu(false); setNameInput(''); setNameKind('zellij'); }}
+            />
+          ) : null}
         </Menu>
       ) : (
         <Button
           mode="contained"
           icon="plus"
-          onPress={createSession}
+          onPress={() => { setNameInput(''); setNameKind('shell'); }}
           loading={creating}
           disabled={creating}
           style={styles.newBtn}
@@ -558,23 +730,17 @@ export default function TerminalScreen() {
 
       <FlatList
         data={[
-          ...tmux.sessions.map((t) => ({ kind: 'tmux' as const, t })),
+          ...tmux.sessions.map((m) => ({ kind: 'tmux' as const, tool: 'tmux' as const, m })),
+          ...zellij.sessions.map((m) => ({ kind: 'zellij' as const, tool: 'zellij' as const, m })),
           ...sessions.map((s) => ({ kind: 'host' as const, s })),
         ]}
-        keyExtractor={(row) => (row.kind === 'tmux' ? `tmux:${row.t.name}` : `host:${row.s.id}`)}
+        keyExtractor={(row) => (row.kind === 'host' ? `host:${row.s.id}` : `${row.kind}:${row.m.name}`)}
         ListEmptyComponent={
           <Text variant="bodyMedium" style={styles.empty}>No sessions yet. Tap “New Session”.</Text>
         }
         ItemSeparatorComponent={Divider}
         renderItem={({ item }) =>
-          item.kind === 'tmux' ? (
-            <List.Item
-              title={item.t.name}
-              description={`tmux · ${item.t.windows} window${item.t.windows === 1 ? '' : 's'}${item.t.attached ? ' · attached' : ''}`}
-              onPress={() => createWithCmd(tmuxAttachCmd(item.t.name))}
-              left={(props) => <List.Icon {...props} icon="view-grid-outline" />}
-            />
-          ) : (
+          item.kind === 'host' ? (
             <List.Item
               title={item.s.title}
               description={`${item.s.id} · ${item.s.cols}×${item.s.rows}${item.s.alive ? '' : ' · exited'}`}
@@ -582,12 +748,69 @@ export default function TerminalScreen() {
               onPress={() => openSession(item.s.id)}
               left={(props) => <List.Icon {...props} icon="console-line" />}
               right={(props) => (
-                <IconButton {...props} icon="trash-can-outline" onPress={() => killSession(item.s.id)} />
+                <IconButton {...props} icon="trash-can-outline" onPress={() => setConfirmKill({ kind: 'host', id: item.s.id, label: item.s.title })} />
+              )}
+            />
+          ) : (
+            <List.Item
+              title={item.m.name}
+              description={
+                item.tool === 'tmux'
+                  ? `tmux · ${item.m.windows ?? 0} window${item.m.windows === 1 ? '' : 's'}${item.m.attached ? ' · attached' : ''}`
+                  : 'zellij'
+              }
+              onPress={() => openMux(item.tool, item.m.name)}
+              left={(props) => <List.Icon {...props} icon={MUX[item.tool].icon} />}
+              right={(props) => (
+                <IconButton {...props} icon="trash-can-outline" onPress={() => setConfirmKill({ kind: item.tool, name: item.m.name })} />
               )}
             />
           )
         }
       />
+
+      <Portal>
+        {/* Name prompt before creating */}
+        <Dialog visible={!!nameKind} onDismiss={() => setNameKind(null)}>
+          <Dialog.Title>
+            {nameKind && nameKind !== 'shell' ? `New ${nameKind} session` : 'New session'}
+          </Dialog.Title>
+          <Dialog.Content>
+            <TextInput
+              mode="outlined"
+              label="Tên session"
+              value={nameInput}
+              onChangeText={setNameInput}
+              autoFocus
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="để trống = tên trái cây ngẫu nhiên"
+              returnKeyType="go"
+              onSubmitEditing={confirmCreate}
+            />
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setNameKind(null)}>Huỷ</Button>
+            <Button onPress={confirmCreate}>Tạo</Button>
+          </Dialog.Actions>
+        </Dialog>
+
+        {/* Confirm before killing */}
+        <Dialog visible={!!confirmKill} onDismiss={() => setConfirmKill(null)}>
+          <Dialog.Title>Xoá session?</Dialog.Title>
+          <Dialog.Content>
+            <Text variant="bodyMedium">
+              {confirmKill
+                ? `Xoá ${confirmKill.kind === 'host' ? 'session' : `${confirmKill.kind} session`} “${confirmKill.kind === 'host' ? confirmKill.label : confirmKill.name}”? Hành động này không thể hoàn tác.`
+                : ''}
+            </Text>
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setConfirmKill(null)}>Huỷ</Button>
+            <Button textColor={theme.colors.error} onPress={doConfirmKill}>Xoá</Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
     </View>
   );
 }
