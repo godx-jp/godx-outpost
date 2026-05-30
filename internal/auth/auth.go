@@ -193,6 +193,10 @@ func (m *Manager) Close() error {
 	return nil
 }
 
+// Store exposes the shared SQLite store (sessions + devices) so other
+// subsystems (the terminal session Manager) can persist to the same database.
+func (m *Manager) Store() *store.Store { return m.store }
+
 // Devices lists all paired clients (for `hostd devices`).
 func (m *Manager) Devices() ([]store.Device, error) { return m.store.ListDevices() }
 
