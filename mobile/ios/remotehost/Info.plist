@@ -7,7 +7,7 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>$(DEVELOPMENT_LANGUAGE)</string>
     <key>CFBundleDisplayName</key>
-    <string>remote-host</string>
+    <string>Outpost</string>
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
     <key>CFBundleIdentifier</key>
@@ -27,8 +27,8 @@
       <dict>
         <key>CFBundleURLSchemes</key>
         <array>
-          <string>remote-host</string>
-          <string>com.famgia.remotehost</string>
+          <string>outpost</string>
+          <string>jp.godx.outpost</string>
         </array>
       </dict>
     </array>
@@ -46,9 +46,9 @@
       <true/>
     </dict>
     <key>NSCameraUsageDescription</key>
-    <string>Allow remote-host to access your camera to scan the pairing QR code.</string>
+    <string>Allow Outpost to access your camera to scan the pairing QR code.</string>
     <key>NSPhotoLibraryUsageDescription</key>
-    <string>Allow remote-host to attach images from your photo library to a terminal session.</string>
+    <string>Allow Outpost to attach images from your photo library to a terminal session.</string>
     <key>NSFaceIDUsageDescription</key>
     <string>Allow $(PRODUCT_NAME) to access your Face ID biometric data.</string>
     <key>NSMicrophoneUsageDescription</key>

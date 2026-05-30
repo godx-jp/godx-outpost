@@ -46,3 +46,11 @@ func ListTmux() []TmuxSession {
 	}
 	return res
 }
+
+// KillTmuxSession terminates a tmux session by name.
+func KillTmuxSession(name string) error {
+	if !TmuxAvailable() {
+		return nil
+	}
+	return exec.Command("tmux", "kill-session", "-t", name).Run()
+}

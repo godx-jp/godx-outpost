@@ -376,19 +376,31 @@ export class Client {
     const refresh = this._refresh;
 
     if (access) {
+      let ok = false;
       try {
         await this.auth(access);
-        this._authed = true;
+        ok = true;
       } catch {
+        // Access rejected (expired/revoked). Try the refresh token once.
         if (refresh) {
-          // refresh() updates the in-memory access token; server now trusts us.
-          await this.refresh(refresh);
-          this._authed = true;
-        } else {
-          this.clearTokens();
-          throw new Error('ws: auth failed and no refresh token available');
+          try {
+            await this.refresh(refresh); // updates the in-memory access token
+            ok = true;
+          } catch { /* refresh also rejected → hard failure below */ }
         }
       }
+      if (!ok) {
+        // The device is no longer authenticated (token revoked from the host,
+        // or expired with no usable refresh). Drop credentials and STOP
+        // reconnecting so the UI falls back to the login screen instead of
+        // sitting on a dead/retrying socket.
+        this.stopped = true;
+        this.ws?.close(1000, 'auth failed');
+        this.ws = null;
+        this.clearTokens(); // _authed = false + notifyChange → login screen
+        throw new Error('ws: authentication failed (revoked or expired)');
+      }
+      this._authed = true;
     }
     // No tokens → caller must pair() before sending application messages.
 
@@ -443,6 +455,9 @@ export class Client {
       try {
         await this._openAndAuth();
       } catch {
+        // A hard auth failure sets stopped=true (revoked/expired) — don't keep
+        // hammering a dead token; the UI is already showing login.
+        if (this.stopped) return;
         this.backoffMs = nextBackoff(this.backoffMs);
         this._scheduleReconnect();
       }

@@ -35,13 +35,83 @@ import (
 type Server struct {
 	mgr          *auth.Manager
 	makeHandlers func() []channel.Handler
+
+	// Live authenticated connections indexed by client id, so a revoked device
+	// can be kicked immediately (its sockets closed) instead of lingering.
+	connMu sync.Mutex
+	conns  map[string]map[*conn]struct{}
 }
 
 // New builds a Server. mgr is the shared auth manager (identity, pairing,
 // tokens). makeHandlers is invoked once per connection to produce a fresh set
 // of per-connection handlers.
 func New(mgr *auth.Manager, makeHandlers func() []channel.Handler) *Server {
-	return &Server{mgr: mgr, makeHandlers: makeHandlers}
+	s := &Server{
+		mgr:          mgr,
+		makeHandlers: makeHandlers,
+		conns:        make(map[string]map[*conn]struct{}),
+	}
+	// When a device is revoked (dashboard "Kick", `revoke` CLI), close its live
+	// connections so the client drops to the login screen instead of staying on
+	// an already-authenticated socket.
+	mgr.SetRevokeHook(s.kickClient)
+	return s
+}
+
+// register records an authenticated connection under its client id.
+func (s *Server) register(clientID string, c *conn) {
+	if clientID == "" {
+		return
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	m := s.conns[clientID]
+	if m == nil {
+		m = make(map[*conn]struct{})
+		s.conns[clientID] = m
+	}
+	m[c] = struct{}{}
+}
+
+// deregister drops a connection from the client-id index (on disconnect).
+func (s *Server) deregister(c *conn) {
+	clientID := c.getClientID()
+	if clientID == "" {
+		return
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if m := s.conns[clientID]; m != nil {
+		delete(m, c)
+		if len(m) == 0 {
+			delete(s.conns, clientID)
+		}
+	}
+}
+
+// kickClient closes every live connection belonging to clientID. Invoked by the
+// auth manager's revoke hook.
+func (s *Server) kickClient(clientID string) {
+	s.connMu.Lock()
+	var victims []*conn
+	for c := range s.conns[clientID] {
+		victims = append(victims, c)
+	}
+	s.connMu.Unlock()
+	for _, c := range victims {
+		// CloseNow drops the TCP connection immediately. We don't use the
+		// graceful Close handshake here: it blocks waiting for the peer to echo
+		// the close frame, which a kicked (possibly stalled) client may never do.
+		_ = c.ws.CloseNow()
+	}
+}
+
+// bindClient associates a freshly authenticated connection with its device
+// client id (from the access token) so a revoke can kick it.
+func (s *Server) bindClient(c *conn, access string) {
+	cid := s.mgr.ClientIDFromAccess(access)
+	c.setClientID(cid)
+	s.register(cid, c)
 }
 
 // ListenAndServe runs an http.Server on addr that upgrades requests to
@@ -88,15 +158,16 @@ func (s *Server) serveConn(ctx context.Context, ws *websocket.Conn) {
 		byChannel[h.Channel()] = h
 	}
 
+	c := &conn{ws: ws}
+
 	// Always release per-connection handler resources on the way out.
 	defer func() {
+		s.deregister(c)
 		for _, h := range handlers {
 			_ = h.Close()
 		}
 		_ = ws.Close(websocket.StatusNormalClosure, "")
 	}()
-
-	c := &conn{ws: ws}
 
 	for {
 		typ, data, err := ws.Read(ctx)
@@ -226,6 +297,7 @@ func (s *Server) handleCtrl(c *conn, env protocol.Envelope) {
 			return
 		}
 		c.setProfile(prof)
+		s.bindClient(c, pair.Access)
 		s.ctrlReply(c, "paired", env.ID, pairedResp{
 			Access: pair.Access, Refresh: pair.Refresh, DeviceID: s.mgr.DeviceID(),
 		})
@@ -242,6 +314,7 @@ func (s *Server) handleCtrl(c *conn, env protocol.Envelope) {
 			return
 		}
 		c.setProfile(prof)
+		s.bindClient(c, req.Access)
 		s.ctrlReply(c, "ok", env.ID, okResp{DeviceID: s.mgr.DeviceID()})
 
 	case "refresh":
@@ -291,9 +364,10 @@ type conn struct {
 
 	mu sync.Mutex // guards all websocket writes
 
-	profMu  sync.RWMutex
-	profile launcher.Profile
-	auth    bool
+	profMu   sync.RWMutex
+	profile  launcher.Profile
+	auth     bool
+	clientID string // device client id (for revoke-kick); "" until authenticated
 }
 
 // writeTimeout bounds a single websocket write. Without it, a write to a stalled
@@ -346,4 +420,18 @@ func (c *conn) authed() bool {
 	c.profMu.RLock()
 	defer c.profMu.RUnlock()
 	return c.auth
+}
+
+// setClientID records the device client id this connection authenticated as.
+func (c *conn) setClientID(id string) {
+	c.profMu.Lock()
+	defer c.profMu.Unlock()
+	c.clientID = id
+}
+
+// getClientID returns the device client id ("" until authenticated).
+func (c *conn) getClientID() string {
+	c.profMu.RLock()
+	defer c.profMu.RUnlock()
+	return c.clientID
 }

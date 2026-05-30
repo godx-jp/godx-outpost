@@ -1,0 +1,10 @@
+@import "@godxjp/ui/styles";
+@source "./**/*.{ts,tsx}";
+
+/* The design system's `narrow` variant only caps the body width (42rem) but
+ * leaves it left-aligned. Center it on screen — the only override needed. */
+.ui-page-container--narrow .ui-page-body,
+.ui-page-container--narrow .ui-page-header {
+  margin-inline: auto;
+  width: 100%;
+}

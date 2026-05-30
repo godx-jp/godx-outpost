@@ -19,7 +19,7 @@
 
 import { useFocusEffect } from 'expo-router';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, FlatList, findNodeHandle, Platform, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, findNodeHandle, Keyboard, Platform, StyleSheet, View } from 'react-native';
 import {
   Appbar, Button, Dialog, Divider, IconButton, List, Menu, Portal, Text, TextInput,
   useTheme,
@@ -34,6 +34,7 @@ import {
   type TermSizeEvent,
 } from '../lib/NativeTerminal';
 import { BinaryKind, Ch, type Envelope } from '../lib/protocol';
+import { getDefaultDir } from '../lib/settings';
 import { takeTermLaunch } from '../lib/termLaunch';
 import { TermToolbar } from '../lib/TermToolbar';
 import { useAuthed } from '../lib/useConn';
@@ -185,6 +186,11 @@ export default function TerminalScreen() {
   const [nameInput, setNameInput] = useState('');
   // Kill-confirmation dialog target (null = closed).
   const [confirmKill, setConfirmKill] = useState<ConfirmKill | null>(null);
+  // Rows whose delete is in flight — disabled (no accidental tap) + spinner.
+  // Keyed like the FlatList: `host:<id>` / `tmux:<name>` / `zellij:<name>`.
+  const [deleting, setDeleting] = useState<Set<string>>(new Set());
+  // Keyboard height, so the name dialog can lift above the keyboard.
+  const [kbHeight, setKbHeight] = useState(0);
   const theme = useTheme<AppTheme>();
   const [activeId, setActiveId]   = useState<string | null>(null);
   const [creating, setCreating]   = useState(false);
@@ -204,6 +210,9 @@ export default function TerminalScreen() {
   creatingRef.current = creating;
   const createTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 80, rows: 24 });
+  // Initial folder for new sessions (from Settings, e.g. ~/projects). Sent with
+  // every create so the shell — and any tmux/zellij launched in it — starts here.
+  const dirRef = useRef<string>('');
   // Output coalescing: terminal output arrives as many small binary frames.
   // Injecting each one across the RN↔WebView bridge separately is the main
   // source of scroll/render jank under heavy output. Instead we accumulate
@@ -224,6 +233,22 @@ export default function TerminalScreen() {
     wsClient.send({ ch: Ch.Term, type: 'list' });
     wsClient.send({ ch: Ch.Term, type: 'list-tmux' });
     wsClient.send({ ch: Ch.Term, type: 'list-zellij' });
+  }, []);
+
+  // Load the configured default folder (keep it fresh when the screen mounts).
+  useEffect(() => {
+    let alive = true;
+    getDefaultDir().then((d) => { if (alive) dirRef.current = d; });
+    return () => { alive = false; };
+  }, []);
+
+  // Track keyboard height so the name dialog lifts above it (it holds a TextInput).
+  useEffect(() => {
+    const showEvt = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvt = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const s = Keyboard.addListener(showEvt, (e) => setKbHeight(e.endCoordinates?.height ?? 0));
+    const h = Keyboard.addListener(hideEvt, () => setKbHeight(0));
+    return () => { s.remove(); h.remove(); };
   }, []);
 
   // Toggle forced landscape (wider terminal) vs free orientation. expo-screen-
@@ -310,6 +335,10 @@ export default function TerminalScreen() {
             setActiveId(null);
             setView('list');
           }
+          setDeleting((prev) => {
+            if (!prev.has(`host:${d.sessionId}`)) return prev;
+            const n = new Set(prev); n.delete(`host:${d.sessionId}`); return n;
+          });
           refreshList();
           break;
       }
@@ -383,7 +412,10 @@ export default function TerminalScreen() {
     }
     setCreating(true);
     try {
-      wsClient.send({ ch: Ch.Term, type: 'create', data: { cols: 80, rows: 24, ...(title ? { title } : {}) } });
+      wsClient.send({
+        ch: Ch.Term, type: 'create',
+        data: { cols: 80, rows: 24, ...(title ? { title } : {}), ...(dirRef.current ? { dir: dirRef.current } : {}) },
+      });
     } catch (e) {
       setCreating(false);
       wsClient.onError?.(`Could not create session: ${(e as Error).message}`);
@@ -455,11 +487,19 @@ export default function TerminalScreen() {
     setTimeout(refreshList, 400);
   };
 
-  // Execute the pending kill after the confirmation dialog.
+  // Execute the pending kill after the confirmation dialog. The row is marked
+  // "deleting" (disabled + spinner) until the host confirms — so a stray tap
+  // during the brief delete window can't re-open/double-act on it.
   const doConfirmKill = () => {
     const target = confirmKill;
     setConfirmKill(null);
     if (!target) return;
+    const key = target.kind === 'host' ? `host:${target.id}` : `${target.kind}:${target.name}`;
+    setDeleting((prev) => new Set(prev).add(key));
+    // Safety net: clear the disabled state even if no confirmation arrives.
+    setTimeout(() => {
+      setDeleting((prev) => { const n = new Set(prev); n.delete(key); return n; });
+    }, 8000);
     if (target.kind === 'host') killSession(target.id);
     else muxKill(target.kind, target.name);
   };
@@ -739,39 +779,52 @@ export default function TerminalScreen() {
           <Text variant="bodyMedium" style={styles.empty}>No sessions yet. Tap “New Session”.</Text>
         }
         ItemSeparatorComponent={Divider}
-        renderItem={({ item }) =>
-          item.kind === 'host' ? (
+        renderItem={({ item }) => {
+          const delKey = item.kind === 'host' ? `host:${item.s.id}` : `${item.tool}:${item.m.name}`;
+          const isDel = deleting.has(delKey);
+          const trashOrSpinner = (props: any) =>
+            isDel ? (
+              <ActivityIndicator {...props} color={theme.colors.error} style={styles.rowSpin} />
+            ) : item.kind === 'host' ? (
+              <IconButton {...props} icon="trash-can-outline" onPress={() => setConfirmKill({ kind: 'host', id: item.s.id, label: item.s.title })} />
+            ) : (
+              <IconButton {...props} icon="trash-can-outline" onPress={() => setConfirmKill({ kind: item.tool, name: item.m.name })} />
+            );
+          return item.kind === 'host' ? (
             <List.Item
               title={item.s.title}
-              description={`${item.s.id} · ${item.s.cols}×${item.s.rows}${item.s.alive ? '' : ' · exited'}`}
+              description={`${item.s.id} · ${item.s.cols}×${item.s.rows}${item.s.alive ? '' : ' · exited'}${isDel ? ' · deleting…' : ''}`}
               descriptionStyle={styles.mono}
-              onPress={() => openSession(item.s.id)}
+              style={isDel ? styles.rowDeleting : undefined}
+              onPress={isDel ? undefined : () => openSession(item.s.id)}
               left={(props) => <List.Icon {...props} icon="console-line" />}
-              right={(props) => (
-                <IconButton {...props} icon="trash-can-outline" onPress={() => setConfirmKill({ kind: 'host', id: item.s.id, label: item.s.title })} />
-              )}
+              right={trashOrSpinner}
             />
           ) : (
             <List.Item
               title={item.m.name}
               description={
-                item.tool === 'tmux'
+                (item.tool === 'tmux'
                   ? `tmux · ${item.m.windows ?? 0} window${item.m.windows === 1 ? '' : 's'}${item.m.attached ? ' · attached' : ''}`
-                  : 'zellij'
+                  : 'zellij') + (isDel ? ' · deleting…' : '')
               }
-              onPress={() => openMux(item.tool, item.m.name)}
+              style={isDel ? styles.rowDeleting : undefined}
+              onPress={isDel ? undefined : () => openMux(item.tool, item.m.name)}
               left={(props) => <List.Icon {...props} icon={MUX[item.tool].icon} />}
-              right={(props) => (
-                <IconButton {...props} icon="trash-can-outline" onPress={() => setConfirmKill({ kind: item.tool, name: item.m.name })} />
-              )}
+              right={trashOrSpinner}
             />
-          )
-        }
+          );
+        }}
       />
 
       <Portal>
-        {/* Name prompt before creating */}
-        <Dialog visible={!!nameKind} onDismiss={() => setNameKind(null)}>
+        {/* Name prompt before creating. Lift above the keyboard (it holds an
+            input) so the on-screen keyboard doesn't cover the field/buttons. */}
+        <Dialog
+          visible={!!nameKind}
+          onDismiss={() => setNameKind(null)}
+          style={kbHeight ? { marginBottom: kbHeight } : undefined}
+        >
           <Dialog.Title>
             {nameKind && nameKind !== 'shell' ? `New ${nameKind} session` : 'New session'}
           </Dialog.Title>
@@ -823,4 +876,6 @@ const styles = StyleSheet.create({
   newBtn: { margin: 16 },
   empty:  { textAlign: 'center', marginTop: 40, paddingHorizontal: 24 },
   uploadSpin: { marginHorizontal: 14 },
+  rowDeleting: { opacity: 0.45 },
+  rowSpin: { marginHorizontal: 16 },
 });

@@ -3,6 +3,9 @@ package term
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/famgia/remote-host/internal/channel"
@@ -51,6 +54,7 @@ type createData struct {
 	Cols  uint16 `json:"cols"`
 	Rows  uint16 `json:"rows"`
 	Title string `json:"title"`
+	Dir   string `json:"dir"` // initial working directory (client setting, e.g. ~/projects)
 }
 
 type attachData struct {
@@ -98,6 +102,10 @@ func (h *Handler) Handle(_ context.Context, e protocol.Envelope, c channel.Conn)
 		return h.list(e, c)
 	case "list-tmux":
 		return h.listTmux(e, c)
+	case "list-zellij":
+		return h.listZellij(e, c)
+	case "mux-kill":
+		return h.muxKill(e, c)
 	case "create":
 		return h.create(e, c)
 	case "attach":
@@ -133,12 +141,52 @@ func (h *Handler) listTmux(e protocol.Envelope, c channel.Conn) error {
 	return c.Send(env)
 }
 
+// listZellij mirrors listTmux for zellij.
+func (h *Handler) listZellij(e protocol.Envelope, c channel.Conn) error {
+	env, err := protocol.NewEnvelope(protocol.ChTerm, "list-zellij", e.ID,
+		map[string]any{"available": ZellijAvailable(), "sessions": ListZellij()})
+	if err != nil {
+		return err
+	}
+	return c.Send(env)
+}
+
+// muxKill terminates a tmux or zellij session by name.
+func (h *Handler) muxKill(e protocol.Envelope, c channel.Conn) error {
+	var d struct {
+		Tool string `json:"tool"`
+		Name string `json:"name"`
+	}
+	if err := e.Bind(&d); err != nil {
+		return fmt.Errorf("term: mux-kill: %w", err)
+	}
+	switch d.Tool {
+	case "tmux":
+		_ = KillTmuxSession(d.Name)
+	case "zellij":
+		_ = KillZellijSession(d.Name)
+	default:
+		return fmt.Errorf("term: mux-kill: unknown tool %q", d.Tool)
+	}
+	env, err := protocol.NewEnvelope(protocol.ChTerm, "mux-kill", e.ID, map[string]bool{"ok": true})
+	if err != nil {
+		return err
+	}
+	return c.Send(env)
+}
+
 func (h *Handler) create(e protocol.Envelope, c channel.Conn) error {
 	var d createData
 	if err := e.Bind(&d); err != nil {
 		return fmt.Errorf("term: create: %w", err)
 	}
-	s, err := h.mgr.Create(c.Profile(), d.Cols, d.Rows, d.Title)
+	// Start the session in the client's chosen folder (e.g. ~/projects). A
+	// dtach shell, and any tmux/zellij launched in it, then inherit this cwd.
+	prof := c.Profile()
+	if dir := expandUserDir(d.Dir); dir != "" {
+		prof.Cwd = dir
+	}
+	s, err := h.mgr.Create(prof, d.Cols, d.Rows, d.Title)
 	if err != nil {
 		return err
 	}
@@ -149,6 +197,25 @@ func (h *Handler) create(e protocol.Envelope, c channel.Conn) error {
 		return err
 	}
 	return c.Send(env)
+}
+
+// expandUserDir expands a leading ~ to the user's home and returns the path
+// only if it exists and is a directory; otherwise "" so the session falls back
+// to the default cwd (home) instead of failing to start on a bad/missing dir.
+func expandUserDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	if dir == "~" || strings.HasPrefix(dir, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			dir = filepath.Join(home, strings.TrimPrefix(dir[1:], "/"))
+		}
+	}
+	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		return dir
+	}
+	return ""
 }
 
 func (h *Handler) attach(e protocol.Envelope, c channel.Conn) error {

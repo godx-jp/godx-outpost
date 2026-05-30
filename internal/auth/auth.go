@@ -93,6 +93,25 @@ type Manager struct {
 	generation    int                    // current revocation generation
 	pairing       map[string]pairingCode // active codes → expiry
 	failedRedeems int                    // consecutive failed RedeemPairing attempts
+
+	// revokeHook, if set, runs after a device is revoked — used by the server to
+	// close that device's live connections. Set via SetRevokeHook.
+	revokeHook func(clientID string)
+}
+
+// SetRevokeHook registers a callback invoked after RevokeDevice succeeds (e.g.
+// to kick the device's live WebSocket connections).
+func (m *Manager) SetRevokeHook(fn func(clientID string)) { m.revokeHook = fn }
+
+// ClientIDFromAccess returns the client id embedded in an access token, or ""
+// if absent/unparseable. Used to tie a live connection to a device so it can be
+// kicked on revoke; the token is assumed already verified by the caller.
+func (m *Manager) ClientIDFromAccess(access string) string {
+	var claims accessClaims
+	if err := m.parse(access, &claims); err != nil {
+		return ""
+	}
+	return claims.ClientID
 }
 
 // maxPairingAttempts is the number of consecutive failed redemptions tolerated
@@ -201,7 +220,15 @@ func (m *Manager) Store() *store.Store { return m.store }
 func (m *Manager) Devices() ([]store.Device, error) { return m.store.ListDevices() }
 
 // RevokeDevice revokes a single paired client by id; its tokens stop working.
-func (m *Manager) RevokeDevice(clientID string) error { return m.store.RevokeDevice(clientID) }
+func (m *Manager) RevokeDevice(clientID string) error {
+	if err := m.store.RevokeDevice(clientID); err != nil {
+		return err
+	}
+	if m.revokeHook != nil {
+		m.revokeHook(clientID) // kick the device's live connections
+	}
+	return nil
+}
 
 // RenameDevice sets a device's display name.
 func (m *Manager) RenameDevice(clientID, name string) error {

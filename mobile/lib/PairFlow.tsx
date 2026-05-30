@@ -137,7 +137,7 @@ export function PairFlow({ onDone, onBack }: { onDone: () => void; onBack?: () =
       </Appbar.Header>
       <View style={styles.form}>
         <Text variant="bodyMedium">
-          Run <Text style={styles.mono}>hostd start</Text> and enter its URL + 6-digit code
+          Run <Text style={styles.mono}>outpost start</Text> and enter its URL + 6-digit code
           {Platform.OS !== 'web' ? ', or scan the QR.' : '.'}
         </Text>
         {error ? <HelperText type="error" visible>{error}</HelperText> : null}
