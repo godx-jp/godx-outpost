@@ -165,6 +165,9 @@ export class Client {
   /** Fired whenever the active host's tokens change (pair/refresh), so the
    *  caller can persist them against the right host. */
   onTokens: ((access: string, refresh: string) => void) | null = null;
+  /** Fired for any server error envelope NOT tied to a pending request, and for
+   *  transport failures. The app surfaces these globally — no silent errors. */
+  onError: ((message: string) => void) | null = null;
 
   // Which host this connection currently targets. Set by the Hosts screen on
   // connect/pair so per-host screens (Terminal/Files/Monitor) can detect a
@@ -432,13 +435,18 @@ export class Client {
         return;
       }
 
+      // Surface any unsolicited error envelope globally so nothing fails
+      // silently (e.g. fs/sys/term errors that aren't request/response).
+      if (env.err) {
+        this.onError?.(`${env.ch}/${env.type}: ${env.err}`);
+      }
       this.onEnvelope?.(env);
     } else {
       let frame: BinaryFrame;
       try {
         frame = decodeBinaryFrame(data);
       } catch (e) {
-        console.warn('ws: received invalid binary frame', e);
+        this.onError?.('received invalid binary frame');
         return;
       }
       this.onBinary?.(frame);

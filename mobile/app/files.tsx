@@ -97,7 +97,7 @@ export default function FilesScreen() {
     }, []),
   );
 
-  if (!wsClient.isConnected) {
+  if (!wsClient.isAuthed) {
     return (
       <View style={styles.center}>
         <Text style={styles.notice}>No host connected. Go to the Hosts tab and connect.</Text>

@@ -85,10 +85,14 @@ export default function TerminalScreen() {
   const [view, setView]         = useState<'list' | 'term'>('list');
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
 
   const webviewRef = useRef<WebView>(null);
   const activeIdRef = useRef<string | null>(null);
   activeIdRef.current = activeId;
+  const creatingRef = useRef(false);
+  creatingRef.current = creating;
+  const createTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 80, rows: 24 });
   // Host this screen last showed sessions for; used to detect a host switch.
   const lastHostRef = useRef<string | null>(wsClient.activeHostId);
@@ -126,6 +130,8 @@ export default function TerminalScreen() {
           break;
         case 'created':
           // New session created on host → open it.
+          if (createTimer.current) clearTimeout(createTimer.current);
+          setCreating(false);
           setActiveId(d.sessionId);
           setView('term');
           break;
@@ -165,7 +171,26 @@ export default function TerminalScreen() {
   }, [refreshList]);
 
   const createSession = () => {
-    wsClient.send({ ch: Ch.Term, type: 'create', data: { cols: 80, rows: 24 } });
+    if (!wsClient.isAuthed) {
+      wsClient.onError?.('Not connected to a host — open the Hosts tab and connect first.');
+      return;
+    }
+    setCreating(true);
+    try {
+      wsClient.send({ ch: Ch.Term, type: 'create', data: { cols: 80, rows: 24 } });
+    } catch (e) {
+      setCreating(false);
+      wsClient.onError?.(`Could not create session: ${(e as Error).message}`);
+      return;
+    }
+    // Feedback if the host never answers (no silent hang).
+    if (createTimer.current) clearTimeout(createTimer.current);
+    createTimer.current = setTimeout(() => {
+      if (creatingRef.current) {
+        setCreating(false);
+        wsClient.onError?.('No response from host when creating a session (timed out).');
+      }
+    }, 6000);
     // activeId/view set when "created" arrives.
   };
 
@@ -211,7 +236,7 @@ export default function TerminalScreen() {
     }
   };
 
-  if (!wsClient.isConnected) {
+  if (!wsClient.isAuthed) {
     return (
       <View style={styles.center}>
         <Text style={styles.notice}>No host connected. Go to the Hosts tab and connect.</Text>
@@ -260,8 +285,12 @@ export default function TerminalScreen() {
         </TouchableOpacity>
       </View>
 
-      <TouchableOpacity style={styles.newBtn} onPress={createSession}>
-        <Text style={styles.newBtnText}>+ New Session</Text>
+      <TouchableOpacity
+        style={[styles.newBtn, creating && styles.newBtnBusy]}
+        onPress={createSession}
+        disabled={creating}
+      >
+        <Text style={styles.newBtnText}>{creating ? 'Creating…' : '+ New Session'}</Text>
       </TouchableOpacity>
 
       <FlatList
@@ -298,6 +327,7 @@ const styles = StyleSheet.create({
   headerTitle: { color: '#888', fontSize: 13, fontFamily: 'monospace', flex: 1, textAlign: 'center' },
   killBtn:     { color: '#ef5350' },
   newBtn:      { margin: 16, padding: 14, borderRadius: 8, borderWidth: 1, borderColor: '#4fc3f7', alignItems: 'center' },
+  newBtnBusy:  { opacity: 0.5 },
   newBtnText:  { color: '#4fc3f7', fontSize: 16, fontWeight: '600' },
   empty:       { color: '#555', textAlign: 'center', marginTop: 24, fontSize: 14 },
   row:         { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 14 },
