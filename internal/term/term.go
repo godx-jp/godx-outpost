@@ -143,9 +143,11 @@ func (h *Handler) attach(e protocol.Envelope, c channel.Conn) error {
 	if err := e.Bind(&d); err != nil {
 		return fmt.Errorf("term: attach: %w", err)
 	}
-	s, ok := h.mgr.Get(d.SessionID)
-	if !ok {
-		return fmt.Errorf("term: no such session %q", d.SessionID)
+	// Attach revives the session from disk (re-attaching a dtach client) if it
+	// isn't in memory — e.g. after a hostd restart.
+	s, err := h.mgr.Attach(c.Profile(), d.SessionID)
+	if err != nil {
+		return err
 	}
 	if d.Cols > 0 && d.Rows > 0 {
 		_ = s.Resize(d.Cols, d.Rows)

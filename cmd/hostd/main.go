@@ -22,7 +22,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -142,9 +144,26 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 			addr := bind + ":" + port
 			wsURL := "ws://" + addr
 
-			// Shared terminal session manager: one per daemon, so sessions
-			// survive connection drops and can be re-attached later.
-			sessions := term.NewManager(launcher.NewDirect())
+			// Shared terminal session manager: one per daemon. When dtach is
+			// available, sessions are backed by dtach sockets under the config
+			// dir, so they survive a hostd restart and can be attached locally
+			// with `dtach -a <socket>` (native scrolling). Otherwise sessions are
+			// in-process and live only for the daemon's lifetime.
+			cfgDir := flagConfigDir
+			if cfgDir == "" {
+				cfgDir, _ = auth.DefaultConfigDir()
+			}
+			sessDir := filepath.Join(cfgDir, "sessions")
+			useDtach := false
+			if _, lerr := exec.LookPath("dtach"); lerr == nil {
+				useDtach = true
+			}
+			if useDtach {
+				fmt.Printf("Sessions        : dtach-backed (survive restart; local: dtach -a %s/<id>.sock)\n", sessDir)
+			} else {
+				fmt.Println("Sessions        : in-process (install dtach for restart-persistent + local attach)")
+			}
+			sessions := term.NewManager(launcher.NewDirect(), sessDir, useDtach)
 
 			// Build the WebSocket server. The handler factory runs fresh per
 			// connection; only the terminal Manager is shared.

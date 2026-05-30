@@ -20,14 +20,22 @@ func NewDirect() Launcher {
 // StartShell launches p.Shell (falling back to $SHELL then /bin/sh) in a PTY
 // with the given initial window size. Sandbox fields in p are ignored.
 func (d *directLauncher) StartShell(p Profile, size Size) (Session, error) {
-	shell := p.Shell
-	if shell == "" {
-		shell = os.Getenv("SHELL")
-	}
-	if shell == "" {
-		shell = "/bin/sh"
-	}
+	return d.StartCommand(p, size, resolveShell(p))
+}
 
+// resolveShell picks the shell for a profile: p.Shell, else $SHELL, else /bin/sh.
+func resolveShell(p Profile) string {
+	if p.Shell != "" {
+		return p.Shell
+	}
+	if s := os.Getenv("SHELL"); s != "" {
+		return s
+	}
+	return "/bin/sh"
+}
+
+// StartCommand launches name+args in a PTY with the profile's cwd/env.
+func (d *directLauncher) StartCommand(p Profile, size Size, name string, args ...string) (Session, error) {
 	cwd := p.Cwd
 	if cwd == "" {
 		home, err := os.UserHomeDir()
@@ -37,7 +45,7 @@ func (d *directLauncher) StartShell(p Profile, size Size) (Session, error) {
 		cwd = home
 	}
 
-	cmd := exec.Command(shell)
+	cmd := exec.Command(name, args...)
 	cmd.Dir = cwd
 	// p.Env is appended last so a profile can intentionally override host env.
 	// SECURITY INVARIANT: p.Env must only ever be populated from server-side

@@ -52,8 +52,13 @@ type Session interface {
 	Close() error
 }
 
-// Launcher spawns shell sessions according to a Profile.
+// Launcher spawns sessions (a shell, or an arbitrary command) in a PTY,
+// according to a Profile.
 type Launcher interface {
-	// StartShell launches a shell with the given profile and initial PTY size.
+	// StartShell launches the profile's shell with the given initial PTY size.
 	StartShell(p Profile, size Size) (Session, error)
+	// StartCommand launches an arbitrary command in a PTY with the profile's
+	// cwd/env. Used to run session managers like dtach. The command inherits the
+	// profile's working directory and environment.
+	StartCommand(p Profile, size Size, name string, args ...string) (Session, error)
 }
