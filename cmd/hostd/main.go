@@ -73,7 +73,7 @@ terminal, file browser, system monitor, and custom API over WebSocket.`,
 
 	root.PersistentFlags().StringVar(&flagConfigDir, "config-dir", "",
 		"identity/token directory (default ~/.config/hostd or platform equivalent); use distinct dirs to run multiple independent hosts")
-	root.AddCommand(startCmd(), pairCmd(), statusCmd(), revokeCmd(), versionCmd(), installCmd(), uninstallCmd())
+	root.AddCommand(startCmd(), pairCmd(), statusCmd(), revokeCmd(), devicesCmd(), versionCmd(), installCmd(), uninstallCmd())
 	return root
 }
 
@@ -140,6 +140,7 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 			if err != nil {
 				return fmt.Errorf("load identity: %w", err)
 			}
+			defer mgr.Close()
 
 			addr := bind + ":" + port
 			wsURL := "ws://" + addr
@@ -257,21 +258,68 @@ func statusCmd() *cobra.Command {
 
 func revokeCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "revoke",
-		Short: "Revoke all outstanding tokens",
-		Long: `Revoke all previously issued tokens.
+		Use:   "revoke [clientId]",
+		Short: "Revoke one device (by client id) or all tokens (no arg)",
+		Long: `Revoke access.
 
-After revocation the next client connection must re-pair by scanning a new
-QR code. Use this when a paired device is lost or compromised.`,
+With a client id (see "hostd devices"), revokes just that device — others stay
+connected. With no argument, revokes ALL tokens (global): every client must
+re-pair. Use this when a paired device is lost or compromised.`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			mgr, err := auth.LoadFrom(flagConfigDir)
 			if err != nil {
 				return fmt.Errorf("load identity: %w", err)
 			}
+			defer mgr.Close()
+			if len(args) == 1 {
+				if err := mgr.RevokeDevice(args[0]); err != nil {
+					return fmt.Errorf("revoke device: %w", err)
+				}
+				fmt.Printf("Device %s revoked. It must re-pair; other devices are unaffected.\n", args[0])
+				return nil
+			}
 			if err := mgr.Revoke(); err != nil {
 				return fmt.Errorf("revoke: %w", err)
 			}
-			fmt.Println("All tokens revoked. Clients must re-pair.")
+			fmt.Println("All tokens revoked. Every device must re-pair.")
+			return nil
+		},
+	}
+}
+
+// ---- devices -----------------------------------------------------------------
+
+func devicesCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "devices",
+		Short: "List paired client devices",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			mgr, err := auth.LoadFrom(flagConfigDir)
+			if err != nil {
+				return fmt.Errorf("load identity: %w", err)
+			}
+			defer mgr.Close()
+			devices, err := mgr.Devices()
+			if err != nil {
+				return fmt.Errorf("list devices: %w", err)
+			}
+			if len(devices) == 0 {
+				fmt.Println("No paired devices yet.")
+				return nil
+			}
+			fmt.Printf("%-18s  %-20s  %-20s  %s\n", "CLIENT ID", "PAIRED", "LAST SEEN", "STATUS")
+			for _, d := range devices {
+				status := "active"
+				if d.Revoked {
+					status = "revoked"
+				}
+				fmt.Printf("%-18s  %-20s  %-20s  %s\n",
+					d.ClientID,
+					time.Unix(d.PairedAt, 0).Format("2006-01-02 15:04"),
+					time.Unix(d.LastSeen, 0).Format("2006-01-02 15:04"),
+					status)
+			}
 			return nil
 		},
 	}

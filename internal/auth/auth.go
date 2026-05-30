@@ -37,6 +37,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/famgia/remote-host/internal/launcher"
+	"github.com/famgia/remote-host/internal/store"
 )
 
 // Token lifetimes. Access tokens are deliberately short so a leaked access
@@ -85,7 +86,8 @@ type pairingCode struct {
 type Manager struct {
 	dir      string // config directory the files live in
 	deviceID string
-	signKey  []byte // decoded HS256 secret
+	signKey  []byte       // decoded HS256 secret
+	store    *store.Store // paired-device records (per-device revoke + audit)
 
 	mu            sync.Mutex
 	generation    int                    // current revocation generation
@@ -100,17 +102,21 @@ type Manager struct {
 // host access to mint a fresh code.
 const maxPairingAttempts = 5
 
-// accessClaims are carried by access tokens. The profile name is the only
-// authority a connection needs to resolve its launcher.Profile.
+// accessClaims are carried by access tokens. The profile name is the authority
+// a connection needs; ClientID ties the token to a paired-device record so a
+// single device can be revoked.
 type accessClaims struct {
-	Profile string `json:"prof"`
+	Profile  string `json:"prof"`
+	ClientID string `json:"cid,omitempty"`
 	jwt.RegisteredClaims
 }
 
-// refreshClaims are carried by refresh tokens. The generation gates revocation;
-// the device ID binds the token to this host's identity.
+// refreshClaims are carried by refresh tokens. The generation gates global
+// revocation; ClientID gates per-device revocation; DeviceID binds the token to
+// this host's identity.
 type refreshClaims struct {
 	DeviceID   string `json:"dev"`
+	ClientID   string `json:"cid,omitempty"`
 	Generation int    `json:"gen"`
 	jwt.RegisteredClaims
 }
@@ -164,14 +170,34 @@ func LoadFrom(configDir string) (*Manager, error) {
 		return nil, err
 	}
 
+	st, err := store.Open(filepath.Join(dir, "hostd.db"))
+	if err != nil {
+		return nil, err
+	}
+
 	return &Manager{
 		dir:        dir,
 		deviceID:   id.DeviceID,
 		signKey:    key,
+		store:      st,
 		generation: gen,
 		pairing:    make(map[string]pairingCode),
 	}, nil
 }
+
+// Close releases the Manager's database handle.
+func (m *Manager) Close() error {
+	if m.store != nil {
+		return m.store.Close()
+	}
+	return nil
+}
+
+// Devices lists all paired clients (for `hostd devices`).
+func (m *Manager) Devices() ([]store.Device, error) { return m.store.ListDevices() }
+
+// RevokeDevice revokes a single paired client by id; its tokens stop working.
+func (m *Manager) RevokeDevice(clientID string) error { return m.store.RevokeDevice(clientID) }
 
 // loadOrCreateIdentity reads identity.json if present (idempotent: existing
 // secrets are returned untouched), otherwise generates and persists fresh ones.
@@ -305,11 +331,18 @@ func (m *Manager) RedeemPairing(code string) (TokenPair, error) {
 	gen := m.generation
 	m.mu.Unlock()
 
-	access, err := m.issueAccess(adminProfileName)
+	// Register this newly paired client so it can be listed and revoked
+	// individually (see `hostd devices` / RevokeDevice).
+	clientID := randomHex(8)
+	if err := m.store.AddDevice(clientID, ""); err != nil {
+		return TokenPair{}, fmt.Errorf("auth: record device: %w", err)
+	}
+
+	access, err := m.issueAccess(adminProfileName, clientID)
 	if err != nil {
 		return TokenPair{}, err
 	}
-	refresh, err := m.issueRefresh(gen)
+	refresh, err := m.issueRefresh(gen, clientID)
 	if err != nil {
 		return TokenPair{}, err
 	}
@@ -331,6 +364,18 @@ func (m *Manager) VerifyAccess(access string) (launcher.Profile, error) {
 	var claims accessClaims
 	if err := m.parse(access, &claims); err != nil {
 		return launcher.Profile{}, err
+	}
+	// Per-device revocation: a token whose client was revoked is rejected.
+	// (Tokens minted before device tracking carry no cid and skip this check.)
+	if claims.ClientID != "" {
+		active, err := m.store.DeviceActive(claims.ClientID)
+		if err != nil {
+			return launcher.Profile{}, err
+		}
+		if !active {
+			return launcher.Profile{}, ErrRevoked
+		}
+		m.store.TouchDevice(claims.ClientID)
 	}
 	return mapProfile(claims.Profile)
 }
@@ -361,7 +406,19 @@ func (m *Manager) RefreshAccess(refresh string) (string, error) {
 		return "", ErrRevoked
 	}
 
-	return m.issueAccess(adminProfileName)
+	// Per-device revocation also gates refresh.
+	if claims.ClientID != "" {
+		active, err := m.store.DeviceActive(claims.ClientID)
+		if err != nil {
+			return "", err
+		}
+		if !active {
+			return "", ErrRevoked
+		}
+		m.store.TouchDevice(claims.ClientID)
+	}
+
+	return m.issueAccess(adminProfileName, claims.ClientID)
 }
 
 // Revoke bumps and persists the generation counter, invalidating every
@@ -378,11 +435,12 @@ func (m *Manager) Revoke() error {
 	return nil
 }
 
-// issueAccess mints a short-lived access token carrying the profile name.
-func (m *Manager) issueAccess(profile string) (string, error) {
+// issueAccess mints a short-lived access token carrying the profile + client id.
+func (m *Manager) issueAccess(profile, clientID string) (string, error) {
 	now := time.Now()
 	claims := accessClaims{
-		Profile: profile,
+		Profile:  profile,
+		ClientID: clientID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   m.deviceID,
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -392,11 +450,12 @@ func (m *Manager) issueAccess(profile string) (string, error) {
 	return m.sign(claims)
 }
 
-// issueRefresh mints a long-lived refresh token bound to deviceID + generation.
-func (m *Manager) issueRefresh(gen int) (string, error) {
+// issueRefresh mints a long-lived refresh token bound to deviceID + generation + client id.
+func (m *Manager) issueRefresh(gen int, clientID string) (string, error) {
 	now := time.Now()
 	claims := refreshClaims{
 		DeviceID:   m.deviceID,
+		ClientID:   clientID,
 		Generation: gen,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   m.deviceID,
@@ -441,6 +500,16 @@ func (m *Manager) pruneExpiredLocked() {
 			delete(m.pairing, c)
 		}
 	}
+}
+
+// randomHex returns a hex string from n random bytes (CSPRNG).
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failure is catastrophic; return a clearly-unusable value.
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 
 // randomDigits returns an n-digit decimal string drawn from a CSPRNG.
