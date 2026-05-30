@@ -1,0 +1,68 @@
+# GoReleaser config for the `outpost` daemon.
+# Builds all platforms, publishes a GitHub Release, and updates a Homebrew tap
+# (famgia/homebrew-tap) + .deb/.rpm packages — so users install via a package
+# manager instead of copying binaries.
+#
+# Cut a release:   git tag v0.1.0 && git push origin v0.1.0   (CI runs goreleaser)
+# Or locally:      TAP_GITHUB_TOKEN=<pat> goreleaser release --clean
+# Validate config: goreleaser check
+version: 2
+project_name: outpost
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: outpost
+    main: ./cmd/outpost
+    binary: outpost
+    env:
+      - CGO_ENABLED=0 # pure-Go (modernc sqlite) → static, cross-compiles cleanly
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: outpost
+    formats: [tar.gz]
+    name_template: "outpost_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+# Homebrew (macOS): `brew install famgia/tap/outpost`.
+homebrew_casks:
+  - name: outpost
+    repository:
+      owner: famgia
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}" # PAT with write access to the tap repo
+    directory: Casks
+    homepage: "https://github.com/famgia/remote-host"
+    description: "Outpost — remote-access host daemon (terminal/files/monitor over WebSocket)"
+    # Strip the Gatekeeper quarantine flag so the freshly downloaded binary runs.
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/outpost"]
+          end
+
+# Linux packages: apt (.deb) / dnf-yum (.rpm).
+nfpms:
+  - id: outpost
+    package_name: outpost
+    maintainer: "famgia <info@famgia.com>"
+    description: "Outpost — remote-access host daemon"
+    license: MIT
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    recommends:
+      - dtach
+
+release:
+  github:
+    owner: famgia
+    name: remote-host
