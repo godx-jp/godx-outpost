@@ -3,7 +3,7 @@
     "name": "remote-host",
     "slug": "remote-host",
     "version": "0.1.0",
-    "orientation": "portrait",
+    "orientation": "default",
     "scheme": "remote-host",
     "userInterfaceStyle": "dark",
     "splash": {

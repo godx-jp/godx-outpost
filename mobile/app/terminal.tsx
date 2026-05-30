@@ -11,16 +11,30 @@
  * Bridge (postMessage):
  *   WebView -> RN: { type:'ready' } | { type:'term/input', data:b64 } | { type:'term/resize', cols, rows }
  *   RN -> WebView: window.__termWrite(b64)
+ *
+ * A rotate button in the terminal toolbar forces landscape (more columns) and
+ * back, via expo-screen-orientation. UI uses react-native-paper; colour comes
+ * from the theme and StyleSheet holds layout only.
  */
 
 import { useFocusEffect } from 'expo-router';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  FlatList, StyleSheet, Text, TouchableOpacity, View,
-} from 'react-native';
+import { FlatList, StyleSheet, View } from 'react-native';
+import { Appbar, Button, Divider, IconButton, List, Text } from 'react-native-paper';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import { BinaryKind, Ch, type Envelope } from '../lib/protocol';
+import { takeTermLaunch } from '../lib/termLaunch';
+import { TermToolbar } from '../lib/TermToolbar';
+import { useAuthed } from '../lib/useConn';
 import { wsClient } from '../lib/ws';
+
+// Encode a string to UTF-8 bytes (TextEncoder isn't guaranteed in RN's engine).
+function utf8Bytes(s: string): Uint8Array {
+  const bin = unescape(encodeURIComponent(s));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
 
 interface SessionInfo {
   id: string; title: string; cols: number; rows: number; alive: boolean; created: number;
@@ -82,10 +96,12 @@ const TERMINAL_HTML = `<!DOCTYPE html>
 </html>`;
 
 export default function TerminalScreen() {
-  const [view, setView]         = useState<'list' | 'term'>('list');
-  const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
+  const [view, setView]           = useState<'list' | 'term'>('list');
+  const [sessions, setSessions]   = useState<SessionInfo[]>([]);
+  const [activeId, setActiveId]   = useState<string | null>(null);
+  const [creating, setCreating]   = useState(false);
+  const [landscape, setLandscape] = useState(false);
+  const authed = useAuthed();
 
   const webviewRef = useRef<WebView>(null);
   const activeIdRef = useRef<string | null>(null);
@@ -96,14 +112,44 @@ export default function TerminalScreen() {
   const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 80, rows: 24 });
   // Host this screen last showed sessions for; used to detect a host switch.
   const lastHostRef = useRef<string | null>(wsClient.activeHostId);
+  // Command to run in the session currently being launched (Files long-press),
+  // moved to initCmds keyed by sessionId once "created" returns.
+  const launchCmdRef = useRef<string | null>(null);
+  const initCmdsRef  = useRef<Record<string, string>>({});
+  // Lets the focus effect call createSession, which is declared further down.
+  const createSessionRef = useRef<(() => void) | null>(null);
 
   const refreshList = useCallback(() => {
     if (wsClient.isConnected) wsClient.send({ ch: Ch.Term, type: 'list' });
   }, []);
 
+  // Toggle forced landscape (wider terminal) vs free orientation. expo-screen-
+  // orientation is a NATIVE module: lazy-import it and ignore failures so this
+  // screen still loads in builds that don't include it (otherwise the whole
+  // Terminal route fails to register and the tab disappears).
+  const toggleOrientation = useCallback(async () => {
+    try {
+      const SO = await import('expo-screen-orientation');
+      if (landscape) {
+        await SO.unlockAsync();
+        setLandscape(false);
+      } else {
+        await SO.lockAsync(SO.OrientationLock.LANDSCAPE);
+        setLandscape(true);
+      }
+    } catch {
+      /* native module not in this build — rotate is a no-op */
+    }
+  }, [landscape]);
+
+  const resetOrientation = useCallback(() => {
+    setLandscape(false);
+    import('expo-screen-orientation').then((SO) => SO.unlockAsync()).catch(() => {});
+  }, []);
+
   // Sessions are per-host. When the tab regains focus, if the active host
   // changed (user switched on the Hosts tab), drop the old host's session
-  // state and re-list for the new host.
+  // state and re-list for the new host. Leaving the tab resets orientation.
   useFocusEffect(
     useCallback(() => {
       if (wsClient.activeHostId !== lastHostRef.current) {
@@ -113,11 +159,19 @@ export default function TerminalScreen() {
         setSessions([]);
       }
       refreshList();
-    }, [refreshList]),
+      // A Files long-press may have queued a "launch here" intent: open a fresh
+      // session and run the command in it once attached.
+      const launch = takeTermLaunch();
+      if (launch && wsClient.isAuthed) {
+        launchCmdRef.current = launch.cmd;
+        createSessionRef.current?.();
+      }
+      return resetOrientation;
+    }, [refreshList, resetOrientation]),
   );
 
   useEffect(() => {
-    if (!wsClient.isConnected) return;
+    if (!authed) return;
 
     const prevEnv = wsClient.onEnvelope;
     wsClient.onEnvelope = (env: Envelope) => {
@@ -132,6 +186,12 @@ export default function TerminalScreen() {
           // New session created on host → open it.
           if (createTimer.current) clearTimeout(createTimer.current);
           setCreating(false);
+          // If this session was launched from Files, remember the command to
+          // type once its WebView attaches.
+          if (launchCmdRef.current) {
+            initCmdsRef.current[d.sessionId] = launchCmdRef.current;
+            launchCmdRef.current = null;
+          }
           setActiveId(d.sessionId);
           setView('term');
           break;
@@ -168,7 +228,7 @@ export default function TerminalScreen() {
       wsClient.onEnvelope = prevEnv;
       wsClient.onBinary = prevBin;
     };
-  }, [refreshList]);
+  }, [authed, refreshList]);
 
   const createSession = () => {
     if (!wsClient.isAuthed) {
@@ -193,6 +253,7 @@ export default function TerminalScreen() {
     }, 6000);
     // activeId/view set when "created" arrives.
   };
+  createSessionRef.current = createSession;
 
   const openSession = (id: string) => {
     setActiveId(id);
@@ -208,10 +269,22 @@ export default function TerminalScreen() {
     if (activeIdRef.current) {
       wsClient.send({ ch: Ch.Term, type: 'detach', data: { sessionId: activeIdRef.current } });
     }
+    resetOrientation();
     setActiveId(null);
     setView('list');
     refreshList();
   };
+
+  // Toolbar key → send raw bytes to the session, then refocus xterm's input so
+  // the on-screen keyboard stays open.
+  const sendKeys = useCallback((bytes: number[]) => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    wsClient.sendBinary({ kind: BinaryKind.TermInput, streamID: id, payload: new Uint8Array(bytes) });
+    webviewRef.current?.injectJavaScript(
+      "var t=document.querySelector('.xterm-helper-textarea'); if(t)t.focus(); true;",
+    );
+  }, []);
 
   const handleWebViewMessage = (event: WebViewMessageEvent) => {
     let msg: { type: string; data?: string; cols?: number; rows?: number };
@@ -225,6 +298,16 @@ export default function TerminalScreen() {
         ch: Ch.Term, type: 'attach',
         data: { sessionId: id, cols: lastSizeRef.current.cols, rows: lastSizeRef.current.rows },
       });
+      // If launched from Files, type the queued command once the shell settles.
+      const init = initCmdsRef.current[id];
+      if (init) {
+        delete initCmdsRef.current[id];
+        setTimeout(() => {
+          wsClient.sendBinary({
+            kind: BinaryKind.TermInput, streamID: id, payload: utf8Bytes(`${init}\r`),
+          });
+        }, 450);
+      }
     } else if (msg.type === 'term/input' && msg.data) {
       const bin = atob(msg.data);
       const bytes = new Uint8Array(bin.length);
@@ -236,10 +319,10 @@ export default function TerminalScreen() {
     }
   };
 
-  if (!wsClient.isAuthed) {
+  if (!authed) {
     return (
       <View style={styles.center}>
-        <Text style={styles.notice}>No host connected. Go to the Hosts tab and connect.</Text>
+        <Text variant="bodyLarge">No host connected. Go to the Hosts tab and connect.</Text>
       </View>
     );
   }
@@ -247,16 +330,16 @@ export default function TerminalScreen() {
   // ── Terminal view ──────────────────────────────────────────────────────────
   if (view === 'term' && activeId) {
     return (
-      <View style={styles.container}>
-        <View style={styles.termHeader}>
-          <TouchableOpacity onPress={leaveToList}>
-            <Text style={styles.headerBtn}>‹ Sessions</Text>
-          </TouchableOpacity>
-          <Text style={styles.headerTitle} numberOfLines={1}>{activeId}</Text>
-          <TouchableOpacity onPress={() => killSession(activeId)}>
-            <Text style={[styles.headerBtn, styles.killBtn]}>Kill</Text>
-          </TouchableOpacity>
-        </View>
+      <View style={styles.flex}>
+        <Appbar.Header mode="small">
+          <Appbar.BackAction onPress={leaveToList} />
+          <Appbar.Content title={activeId} titleStyle={styles.mono} />
+          <Appbar.Action
+            icon={landscape ? 'phone-rotate-portrait' : 'phone-rotate-landscape'}
+            onPress={toggleOrientation}
+          />
+          <Appbar.Action icon="trash-can-outline" onPress={() => killSession(activeId)} />
+        </Appbar.Header>
         <WebView
           key={activeId}            /* fresh xterm per session */
           ref={webviewRef}
@@ -265,73 +348,62 @@ export default function TerminalScreen() {
           onMessage={handleWebViewMessage}
           originWhitelist={['*']}
           keyboardDisplayRequiresUserAction={false}
+          automaticallyAdjustContentInsets={false}
+          contentInsetAdjustmentBehavior="never"
         />
+        <TermToolbar onKey={sendKeys} />
       </View>
     );
   }
 
   // ── Session list view ───────────────────────────────────────────────────────
   return (
-    <View style={styles.container}>
-      <View style={styles.header}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.heading}>Sessions</Text>
-          <Text style={styles.hostSub} numberOfLines={1}>
-            {wsClient.activeHostName ?? 'host'}
-          </Text>
-        </View>
-        <TouchableOpacity onPress={refreshList}>
-          <Text style={styles.headerBtn}>Refresh</Text>
-        </TouchableOpacity>
-      </View>
+    <View style={styles.flex}>
+      <Appbar.Header mode="small">
+        <Appbar.Content title="Sessions" subtitle={wsClient.activeHostName ?? 'host'} />
+        <Appbar.Action icon="refresh" onPress={refreshList} />
+      </Appbar.Header>
 
-      <TouchableOpacity
-        style={[styles.newBtn, creating && styles.newBtnBusy]}
+      <Button
+        mode="contained"
+        icon="plus"
         onPress={createSession}
+        loading={creating}
         disabled={creating}
+        style={styles.newBtn}
       >
-        <Text style={styles.newBtnText}>{creating ? 'Creating…' : '+ New Session'}</Text>
-      </TouchableOpacity>
+        {creating ? 'Creating…' : 'New Session'}
+      </Button>
 
       <FlatList
         data={sessions}
         keyExtractor={(s) => s.id}
-        ListEmptyComponent={<Text style={styles.empty}>No sessions yet. Tap “New Session”.</Text>}
+        ListEmptyComponent={
+          <Text variant="bodyMedium" style={styles.empty}>No sessions yet. Tap “New Session”.</Text>
+        }
+        ItemSeparatorComponent={Divider}
         renderItem={({ item }) => (
-          <TouchableOpacity style={styles.row} onPress={() => openSession(item.id)}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.rowTitle}>{item.title}</Text>
-              <Text style={styles.rowSub}>{item.id} · {item.cols}×{item.rows}{item.alive ? '' : ' · exited'}</Text>
-            </View>
-            <TouchableOpacity onPress={() => killSession(item.id)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-              <Text style={[styles.headerBtn, styles.killBtn]}>Kill</Text>
-            </TouchableOpacity>
-          </TouchableOpacity>
+          <List.Item
+            title={item.title}
+            description={`${item.id} · ${item.cols}×${item.rows}${item.alive ? '' : ' · exited'}`}
+            descriptionStyle={styles.mono}
+            onPress={() => openSession(item.id)}
+            left={(props) => <List.Icon {...props} icon="console-line" />}
+            right={(props) => (
+              <IconButton {...props} icon="trash-can-outline" onPress={() => killSession(item.id)} />
+            )}
+          />
         )}
-        ItemSeparatorComponent={() => <View style={styles.separator} />}
       />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container:   { flex: 1, backgroundColor: '#0d0d0d' },
-  webview:     { flex: 1, backgroundColor: '#0d0d0d' },
-  center:      { flex: 1, backgroundColor: '#0d0d0d', alignItems: 'center', justifyContent: 'center', padding: 24 },
-  notice:      { color: '#aaaaaa', fontSize: 15, textAlign: 'center' },
-  header:      { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 16, borderBottomWidth: 1, borderBottomColor: '#222' },
-  termHeader:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 12, backgroundColor: '#111', borderBottomWidth: 1, borderBottomColor: '#222' },
-  heading:     { color: '#e0e0e0', fontSize: 20, fontWeight: '700' },
-  hostSub:     { color: '#4fc3f7', fontSize: 12, fontFamily: 'monospace', marginTop: 2 },
-  headerBtn:   { color: '#4fc3f7', fontSize: 15 },
-  headerTitle: { color: '#888', fontSize: 13, fontFamily: 'monospace', flex: 1, textAlign: 'center' },
-  killBtn:     { color: '#ef5350' },
-  newBtn:      { margin: 16, padding: 14, borderRadius: 8, borderWidth: 1, borderColor: '#4fc3f7', alignItems: 'center' },
-  newBtnBusy:  { opacity: 0.5 },
-  newBtnText:  { color: '#4fc3f7', fontSize: 16, fontWeight: '600' },
-  empty:       { color: '#555', textAlign: 'center', marginTop: 24, fontSize: 14 },
-  row:         { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 14 },
-  rowTitle:    { color: '#e0e0e0', fontSize: 16 },
-  rowSub:      { color: '#666', fontSize: 12, fontFamily: 'monospace', marginTop: 2 },
-  separator:   { height: 1, backgroundColor: '#1a1a1a', marginLeft: 16 },
+  flex:    { flex: 1 },
+  webview: { flex: 1, backgroundColor: '#0d0d0d' },
+  center:  { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
+  mono:    { fontFamily: 'monospace', fontSize: 13 },
+  newBtn: { margin: 16 },
+  empty:  { textAlign: 'center', marginTop: 40, paddingHorizontal: 24 },
 });

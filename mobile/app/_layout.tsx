@@ -1,14 +1,32 @@
-import { Tabs } from "expo-router";
-import { StatusBar } from "expo-status-bar";
-import React, { useEffect, useRef, useState } from "react";
-import { Platform, StyleSheet, Text, TouchableOpacity, View } from "react-native";
-import { wsClient } from "../lib/ws";
+import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { ThemeProvider } from '@react-navigation/native';
+import { Tabs } from 'expo-router';
+import { StatusBar } from 'expo-status-bar';
+import React, { useEffect, useRef, useState } from 'react';
+import { StyleSheet, View } from 'react-native';
+import { ActivityIndicator, PaperProvider, Snackbar, Text } from 'react-native-paper';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { getActiveHostId, getHost, updateHostTokens } from '../lib/hosts';
+import { HostsManager } from '../lib/HostsManager';
+import { navTheme, theme } from '../lib/theme';
+import { useAuthed } from '../lib/useConn';
+import { wsClient } from '../lib/ws';
+
+// Tab bar icons (Ionicons). Colour is supplied by the navigator from navTheme.
+type IoniconName = React.ComponentProps<typeof Ionicons>['name'];
+const tabIcon = (name: IoniconName) =>
+  ({ color, size }: { color: string; size: number }) => (
+    <Ionicons name={name} color={color} size={size} />
+  );
 
 export default function RootLayout() {
-  // Global error banner — nothing fails silently. Any unsolicited server error
-  // envelope or transport problem surfaces here.
+  // Global error surface — nothing fails silently.
   const [err, setErr] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // True until the launch-time reconnect attempt resolves (avoids flashing the
+  // login screen before an auto-reconnect to the last host completes).
+  const [booting, setBooting] = useState(true);
+  const authed = useAuthed();
 
   useEffect(() => {
     wsClient.onError = (message) => {
@@ -22,53 +40,71 @@ export default function RootLayout() {
     };
   }, []);
 
-  return (
-    <View style={{ flex: 1, backgroundColor: "#0d0d0d" }}>
-      <StatusBar style="light" />
-      <Tabs
-        screenOptions={{
-          headerStyle: { backgroundColor: "#0d0d0d" },
-          headerTintColor: "#e0e0e0",
-          tabBarStyle: { backgroundColor: "#111111", borderTopColor: "#222222" },
-          tabBarActiveTintColor: "#4fc3f7",
-          tabBarInactiveTintColor: "#555555",
-        }}
-      >
-        <Tabs.Screen name="index" options={{ title: "Hosts", tabBarLabel: "Hosts" }} />
-        <Tabs.Screen name="terminal" options={{ title: "Terminal", tabBarLabel: "Terminal" }} />
-        <Tabs.Screen name="files" options={{ title: "Files", tabBarLabel: "Files" }} />
-        <Tabs.Screen name="monitor" options={{ title: "Monitor", tabBarLabel: "Monitor" }} />
-        <Tabs.Screen name="custom" options={{ title: "Custom", tabBarLabel: "Custom" }} />
-      </Tabs>
+  // Persist refreshed tokens to the active host, and auto-reconnect on launch.
+  useEffect(() => {
+    wsClient.onTokens = (access, refresh) => {
+      const id = wsClient.activeHostId;
+      if (id) void updateHostTokens(id, access, refresh);
+    };
 
-      {err ? (
-        <TouchableOpacity
-          style={styles.banner}
-          activeOpacity={0.9}
-          onPress={() => setErr(null)}
-        >
-          <Text style={styles.bannerLabel}>⚠︎ Error</Text>
-          <Text style={styles.bannerText} numberOfLines={3}>{err}</Text>
-          <Text style={styles.bannerDismiss}>tap to dismiss</Text>
-        </TouchableOpacity>
-      ) : null}
-    </View>
+    let cancelled = false;
+    (async () => {
+      const aid = await getActiveHostId();
+      const h = aid ? await getHost(aid) : undefined;
+      if (h && !cancelled) {
+        wsClient.setTokens(h.access, h.refresh);
+        wsClient.activeHostId = h.id;
+        wsClient.activeHostName = h.name;
+        await wsClient.resume(h.url);
+      }
+      if (!cancelled) setBooting(false);
+    })();
+
+    return () => {
+      cancelled = true;
+      wsClient.onTokens = null;
+    };
+  }, []);
+
+  return (
+    <SafeAreaProvider>
+      <PaperProvider
+        theme={theme}
+        settings={{ icon: (props) => <MaterialCommunityIcons {...props} /> }}
+      >
+        <ThemeProvider value={navTheme}>
+          <StatusBar style="light" />
+          {booting ? (
+            <View style={styles.center}>
+              <ActivityIndicator size="large" />
+              <Text variant="bodyMedium" style={styles.bootMsg}>Connecting…</Text>
+            </View>
+          ) : !authed ? (
+            <HostsManager mode="login" />
+          ) : (
+            <Tabs screenOptions={{ headerShown: false }}>
+              <Tabs.Screen name="index"    options={{ href: null }} />
+              <Tabs.Screen name="terminal" options={{ title: 'Terminal', tabBarIcon: tabIcon('terminal-outline') }} />
+              <Tabs.Screen name="files"    options={{ title: 'Files',    tabBarIcon: tabIcon('folder-outline') }} />
+              <Tabs.Screen name="monitor"  options={{ title: 'Monitor',  tabBarIcon: tabIcon('pulse-outline') }} />
+              <Tabs.Screen name="more"     options={{ title: 'More',     tabBarIcon: tabIcon('ellipsis-horizontal') }} />
+            </Tabs>
+          )}
+          <Snackbar
+            visible={!!err}
+            onDismiss={() => setErr(null)}
+            duration={6000}
+            action={{ label: 'Dismiss', onPress: () => setErr(null) }}
+          >
+            {err ?? ''}
+          </Snackbar>
+        </ThemeProvider>
+      </PaperProvider>
+    </SafeAreaProvider>
   );
 }
 
 const styles = StyleSheet.create({
-  banner: {
-    position: "absolute",
-    top: Platform.OS === "ios" ? 58 : 24,
-    left: 12,
-    right: 12,
-    backgroundColor: "#3a1414",
-    borderColor: "#ef5350",
-    borderWidth: 1,
-    borderRadius: 10,
-    padding: 12,
-  },
-  bannerLabel:   { color: "#ef5350", fontSize: 12, fontWeight: "700", marginBottom: 2 },
-  bannerText:    { color: "#f5d2d2", fontSize: 13 },
-  bannerDismiss: { color: "#a06a6a", fontSize: 11, marginTop: 4 },
+  center:  { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
+  bootMsg: { marginTop: 16 },
 });

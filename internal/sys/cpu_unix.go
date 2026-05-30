@@ -3,13 +3,16 @@
 package sys
 
 import (
+	"bytes"
+	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
-	"time"
-
-	"golang.org/x/sys/unix"
 )
 
-// cpuSample holds a single snapshot of aggregate CPU ticks.
+// cpuSample holds a single snapshot of aggregate CPU ticks (Linux /proc/stat).
 type cpuSample struct {
 	total float64
 	idle  float64
@@ -20,77 +23,94 @@ var (
 	lastCPU *cpuSample
 )
 
-// cpuPercent returns the current overall CPU usage percentage.
-// It computes a delta against the previous sample (initially a brief poll).
+// cpuPercent returns the overall CPU usage percentage (0–100).
+//
+//   - Linux: delta of the aggregate "cpu" line in /proc/stat between calls —
+//     accurate, pure-Go, no cgo.
+//   - macOS / BSD: there is no cheap pure-Go tick source (kern.cpuload does not
+//     exist on Darwin, and gopsutil/cpu requires cgo on Darwin), so we sum the
+//     per-process %CPU reported by `ps` and normalise by the logical CPU count.
+//     `ps` is already used for the process list and is available everywhere.
 func cpuPercent() float64 {
-	curr := readCPUSample()
-	if curr == nil {
+	if runtime.GOOS == "linux" {
+		return cpuPercentProcStat()
+	}
+	return cpuPercentPS()
+}
+
+// cpuPercentProcStat computes usage from the delta of /proc/stat (Linux).
+func cpuPercentProcStat() float64 {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
 		return 0
 	}
+	// First line: "cpu  user nice system idle iowait irq softirq steal ...".
+	nl := bytes.IndexByte(data, '\n')
+	if nl < 0 {
+		nl = len(data)
+	}
+	fields := strings.Fields(string(data[:nl]))
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0
+	}
+	var total, idle float64
+	for i, f := range fields[1:] {
+		v, perr := strconv.ParseFloat(f, 64)
+		if perr != nil {
+			continue
+		}
+		total += v
+		if i == 3 || i == 4 { // idle + iowait
+			idle += v
+		}
+	}
 
+	curr := &cpuSample{total: total, idle: idle}
 	cpuMu.Lock()
 	prev := lastCPU
 	lastCPU = curr
 	cpuMu.Unlock()
 
 	if prev == nil {
-		// First call: sleep briefly to get a meaningful delta.
-		time.Sleep(50 * time.Millisecond)
-		curr2 := readCPUSample()
-		if curr2 == nil {
-			return 0
-		}
-		cpuMu.Lock()
-		lastCPU = curr2
-		cpuMu.Unlock()
-		prev = curr
-		curr = curr2
+		return 0 // first sample; next tick yields a real delta
 	}
-
 	totalDelta := curr.total - prev.total
 	idleDelta := curr.idle - prev.idle
 	if totalDelta <= 0 {
 		return 0
 	}
-	return (1 - idleDelta/totalDelta) * 100
+	return clampPct((1 - idleDelta/totalDelta) * 100)
 }
 
-// readCPUSample reads the aggregate CPU tick counts from the kernel.
-// On Darwin it uses host_statistics via Mach traps exposed through unix.
-// On Linux it reads the "cpu" line from /proc/stat via sysinfo or Sysctl.
-func readCPUSample() *cpuSample {
-	// Use getrusage-based clock times via unix.Times which is portable.
-	// For overall system CPU we use the loadavg as a proxy when direct
-	// tick access isn't available without extra deps.
-	//
-	// Darwin: use kern.cpuload sysctl (available on macOS 10.8+).
-	// Format: array of uint32 [user, sys, idle, nice] per logical CPU.
-	raw, err := unix.SysctlRaw("kern.cpuload")
+// cpuPercentPS sums per-process %CPU from `ps` and divides by the logical CPU
+// count to yield an overall 0–100 figure (macOS / BSD). `ps` %cpu is a decaying
+// average, so this tracks sustained load rather than instantaneous spikes.
+func cpuPercentPS() float64 {
+	out, err := exec.Command("ps", "-A", "-o", "pcpu").Output()
 	if err != nil {
-		// Fallback: return nil so caller handles gracefully.
-		return nil
+		return 0
 	}
+	var sum float64
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		v, perr := strconv.ParseFloat(strings.TrimSpace(line), 64)
+		if perr != nil {
+			continue // header ("%CPU") or blank
+		}
+		sum += v
+	}
+	n := runtime.NumCPU()
+	if n < 1 {
+		n = 1
+	}
+	return clampPct(sum / float64(n))
+}
 
-	// kern.cpuload returns one uint32[CPU_STATE_MAX=4] per logical CPU.
-	// Layout: [user, sys, idle, nice] × numCPU
-	const stateSize = 4 * 4 // 4 uint32s per CPU
-	if len(raw) < stateSize {
-		return nil
+func clampPct(p float64) float64 {
+	if p < 0 {
+		return 0
 	}
-
-	var totalTicks, idleTicks uint64
-	numCPU := len(raw) / stateSize
-	for i := 0; i < numCPU; i++ {
-		off := i * stateSize
-		user := uint64(raw[off]) | uint64(raw[off+1])<<8 | uint64(raw[off+2])<<16 | uint64(raw[off+3])<<24
-		off += 4
-		sys := uint64(raw[off]) | uint64(raw[off+1])<<8 | uint64(raw[off+2])<<16 | uint64(raw[off+3])<<24
-		off += 4
-		idle := uint64(raw[off]) | uint64(raw[off+1])<<8 | uint64(raw[off+2])<<16 | uint64(raw[off+3])<<24
-		off += 4
-		nice := uint64(raw[off]) | uint64(raw[off+1])<<8 | uint64(raw[off+2])<<16 | uint64(raw[off+3])<<24
-		totalTicks += user + sys + idle + nice
-		idleTicks += idle
+	if p > 100 {
+		return 100
 	}
-	return &cpuSample{total: float64(totalTicks), idle: float64(idleTicks)}
+	return p
 }

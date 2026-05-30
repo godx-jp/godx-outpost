@@ -88,6 +88,23 @@ export async function storageSet(key: string, value: string): Promise<void> {
   }
 }
 
+// deviceInfo returns this device's display name + a human type string, sent at
+// pairing so the host can show/manage "which machine" in the dashboard.
+async function deviceInfo(): Promise<{ name: string; platform: string }> {
+  try {
+    const D = (await import('expo-device')) as {
+      deviceName?: string | null; modelName?: string | null;
+      osName?: string | null; osVersion?: string | null;
+    };
+    const name = D.deviceName || D.modelName || 'device';
+    const os = [D.osName, D.osVersion].filter(Boolean).join(' ');
+    const platform = [D.modelName, os].filter(Boolean).join(' · ');
+    return { name, platform };
+  } catch {
+    return { name: 'device', platform: '' };
+  }
+}
+
 // Tokens are NOT persisted globally here — the app supports multiple hosts, so
 // each host's tokens are stored per-host by lib/hosts.ts. The Client holds the
 // *active* host's tokens in memory and reports changes via onTokens so the
@@ -146,7 +163,7 @@ export type ClientStatus =
 
 // NOTE: these field names mirror the Go server's ctrl payloads exactly
 // (internal/server/server.go). Do not rename without changing the server.
-interface PairRequest     { code: string }
+interface PairRequest     { code: string; name?: string; platform?: string }
 interface PairResponse    { access: string; refresh: string; deviceId: string } // ctrl "paired"
 interface AuthRequest     { access: string }
 interface AuthResponse    { deviceId: string }                  // ctrl "ok"
@@ -179,6 +196,21 @@ export class Client {
   // lib/hosts.ts). Seed via setTokens() before connect()/resume().
   private _access:  string | null = null;
   private _refresh: string | null = null;
+
+  // Reactive change listeners (status/auth). UI hooks subscribe so screens
+  // re-render when the connection or auth state changes — without this they'd
+  // read isAuthed once and never update.
+  private changeListeners = new Set<() => void>();
+
+  /** Subscribe to connection/auth changes; returns an unsubscribe function. */
+  addChangeListener(fn: () => void): () => void {
+    this.changeListeners.add(fn);
+    return () => this.changeListeners.delete(fn);
+  }
+
+  private notifyChange(): void {
+    for (const l of this.changeListeners) l();
+  }
 
   private url:    string | null = null;
   private ws:     WebSocket | null = null;
@@ -224,6 +256,7 @@ export class Client {
     this._access = null;
     this._refresh = null;
     this._authed = false;
+    this.notifyChange();
   }
 
   /**
@@ -257,13 +290,15 @@ export class Client {
    * deviceId so the caller can save this host. The socket is authenticated.
    */
   async pair(code: string): Promise<{ access: string; refresh: string; deviceId: string }> {
+    const info = await deviceInfo();
     const res = await this._request<PairRequest, PairResponse>(
-      Ch.Ctrl, 'pair', { code },
+      Ch.Ctrl, 'pair', { code, name: info.name, platform: info.platform },
     );
     this._access = res.access;
     this._refresh = res.refresh;
     this._authed = true;
     this.onTokens?.(res.access, res.refresh);
+    this.notifyChange();
     return res;
   }
 
@@ -490,6 +525,7 @@ export class Client {
   private _setStatus(s: ClientStatus, err?: Error): void {
     this.status = s;
     this.onStatus?.(s, err);
+    this.notifyChange();
   }
 
   // ---------------------------------------------------------------------------

@@ -5,21 +5,30 @@
  * Reads:  { ch: Ch.FS, type: 'list',  data: { cwd, entries[] } }
  *         { ch: Ch.FS, type: 'error', err: string }
  *
- * Full implementation will support read, write, rename, delete.
+ * Full implementation will support read, write, rename, delete. UI uses
+ * react-native-paper; colour comes from the theme, StyleSheet holds layout only.
  */
 
-import { useFocusEffect } from 'expo-router';
+import { router, useFocusEffect } from 'expo-router';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { FlatList, StyleSheet, View } from 'react-native';
 import {
-  ActivityIndicator,
-  FlatList,
-  StyleSheet,
-  Text,
-  TouchableOpacity,
-  View,
-} from 'react-native';
+  ActivityIndicator, Appbar, Dialog, Divider, HelperText, List, Portal, Text,
+} from 'react-native-paper';
 import { Ch, type Envelope } from '../lib/protocol';
+import { DEFAULT_FILES_DIR, getDefaultDir } from '../lib/settings';
+import { buildLaunchCmd, type LaunchKind, setTermLaunch } from '../lib/termLaunch';
+import { useAuthed } from '../lib/useConn';
 import { wsClient } from '../lib/ws';
+
+// Long-press launch options, in display order.
+const LAUNCH_OPTIONS: { kind: LaunchKind; label: string; icon: string }[] = [
+  { kind: 'term',        label: 'Mở Terminal tại đây',        icon: 'console' },
+  { kind: 'claude',      label: 'Mở Claude',                  icon: 'robot-outline' },
+  { kind: 'claude-yolo', label: 'Mở Claude (cấp mọi quyền)',  icon: 'robot-excited-outline' },
+  { kind: 'codex',       label: 'Mở Codex',                   icon: 'code-tags' },
+  { kind: 'codex-yolo',  label: 'Mở Codex (cấp mọi quyền)',   icon: 'code-greater-than' },
+];
 
 interface FileEntry {
   name:  string;
@@ -34,19 +43,27 @@ interface ListResponse {
 }
 
 export default function FilesScreen() {
+  const authed = useAuthed();
   const [entries, setEntries]   = useState<FileEntry[]>([]);
   const [loading, setLoading]   = useState(false);
-  const [cwd, setCwd]           = useState('~');
+  const [cwd, setCwd]           = useState(DEFAULT_FILES_DIR);
   const [error, setError]       = useState('');
+  // Stack of parent directories visited, so "back" returns to the folder we
+  // came from. Empty at the home directory (no back button shown).
+  const [stack, setStack]       = useState<string[]>([]);
+  // Folder name the long-press launch menu is open for (null = closed).
+  const [menuFor, setMenuFor]   = useState<string | null>(null);
 
   const cwdRef = useRef(cwd);
   cwdRef.current = cwd;
   // Path of the in-flight list request; promoted to cwd when it succeeds.
-  const pendingPathRef = useRef('~');
+  const pendingPathRef = useRef(DEFAULT_FILES_DIR);
   const lastHostRef = useRef<string | null>(wsClient.activeHostId);
+  // Configurable default directory (Settings); the "projects" shortcut target.
+  const homeDirRef = useRef(DEFAULT_FILES_DIR);
 
   useEffect(() => {
-    if (!wsClient.isConnected) return;
+    if (!authed) return;
 
     const prevOnEnvelope = wsClient.onEnvelope;
     wsClient.onEnvelope = (env: Envelope) => {
@@ -69,12 +86,16 @@ export default function FilesScreen() {
       }
     };
 
-    listDir('~');
+    // Load the configured default directory, then list it.
+    void getDefaultDir().then((dir) => {
+      homeDirRef.current = dir;
+      listDir(dir);
+    });
 
     return () => {
       wsClient.onEnvelope = prevOnEnvelope;
     };
-  }, []);
+  }, [authed]);
 
   const listDir = (path: string) => {
     if (!wsClient.isConnected) return;
@@ -82,6 +103,35 @@ export default function FilesScreen() {
     setLoading(true);
     setError('');
     wsClient.send({ ch: Ch.FS, type: 'list', data: { path } });
+  };
+
+  // Descend into a child directory, remembering the current one for "back".
+  const enterDir = (name: string) => {
+    setStack((s) => [...s, cwdRef.current]);
+    listDir(`${cwdRef.current}/${name}`);
+  };
+
+  // Return to the folder we came from (parent of the current directory).
+  const goBack = () => {
+    if (stack.length === 0) return;
+    const target = stack[stack.length - 1];
+    setStack(stack.slice(0, -1));
+    listDir(target);
+  };
+
+  // Jump straight back to the default directory (header shortcut).
+  const goProjects = () => {
+    setStack([]);
+    listDir(homeDirRef.current);
+  };
+
+  // Long-press launch: queue a "run here" command and switch to the Terminal
+  // tab, which opens a new session in this folder and runs it.
+  const launch = (name: string, kind: LaunchKind) => {
+    const path = `${cwdRef.current}/${name}`;
+    setTermLaunch({ cmd: buildLaunchCmd(path, kind) });
+    setMenuFor(null);
+    router.navigate('/terminal');
   };
 
   // Files are per-host: when the active host changed (switched on the Hosts
@@ -92,51 +142,75 @@ export default function FilesScreen() {
         lastHostRef.current = wsClient.activeHostId;
         setEntries([]);
         setError('');
-        listDir('~');
+        setStack([]);
+        void getDefaultDir().then((dir) => {
+          homeDirRef.current = dir;
+          listDir(dir);
+        });
       }
     }, []),
   );
 
-  if (!wsClient.isAuthed) {
+  if (!authed) {
     return (
       <View style={styles.center}>
-        <Text style={styles.notice}>No host connected. Go to the Hosts tab and connect.</Text>
+        <Text variant="bodyLarge">No host connected. Go to the Hosts tab and connect.</Text>
       </View>
     );
   }
 
   return (
-    <View style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.cwd} numberOfLines={1}>{cwd}</Text>
-        <TouchableOpacity onPress={() => listDir(cwdRef.current)}>
-          <Text style={styles.refresh}>Refresh</Text>
-        </TouchableOpacity>
-      </View>
+    <View style={styles.flex}>
+      <Appbar.Header mode="small">
+        {stack.length > 0 ? <Appbar.BackAction onPress={goBack} /> : null}
+        <Appbar.Content title="Files" subtitle={cwd} subtitleStyle={styles.mono} />
+        <Appbar.Action icon="folder-home" onPress={goProjects} />
+        <Appbar.Action icon="refresh" onPress={() => listDir(cwdRef.current)} />
+      </Appbar.Header>
 
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {error ? <HelperText type="error" visible>{error}</HelperText> : null}
 
       {loading ? (
-        <ActivityIndicator style={{ marginTop: 32 }} color="#4fc3f7" />
+        <View style={styles.center}>
+          <ActivityIndicator />
+        </View>
       ) : (
         <FlatList
           data={entries}
           keyExtractor={(item) => item.name}
+          ItemSeparatorComponent={Divider}
           renderItem={({ item }) => (
-            <TouchableOpacity
-              style={styles.entry}
-              onPress={() => item.isDir && listDir(`${cwdRef.current}/${item.name}`)}
-            >
-              <Text style={styles.entryIcon}>{item.isDir ? 'D' : 'F'}</Text>
-              <Text style={styles.entryName} numberOfLines={1}>{item.name}</Text>
-              {!item.isDir && item.size !== undefined
-                ? <Text style={styles.entrySize}>{formatSize(item.size)}</Text>
-                : null}
-            </TouchableOpacity>
+            <List.Item
+              title={item.name}
+              titleNumberOfLines={1}
+              onPress={() => item.isDir && enterDir(item.name)}
+              onLongPress={() => item.isDir && setMenuFor(item.name)}
+              left={(props) => <List.Icon {...props} icon={item.isDir ? 'folder' : 'file-outline'} />}
+              right={() =>
+                !item.isDir && item.size !== undefined ? (
+                  <Text variant="bodySmall" style={styles.size}>{formatSize(item.size)}</Text>
+                ) : null
+              }
+            />
           )}
-          ItemSeparatorComponent={() => <View style={styles.separator} />}
         />
       )}
+
+      <Portal>
+        <Dialog visible={!!menuFor} onDismiss={() => setMenuFor(null)}>
+          <Dialog.Title numberOfLines={1}>{menuFor ?? ''}</Dialog.Title>
+          <Dialog.Content>
+            {LAUNCH_OPTIONS.map((opt) => (
+              <List.Item
+                key={opt.kind}
+                title={opt.label}
+                onPress={() => menuFor && launch(menuFor, opt.kind)}
+                left={(props) => <List.Icon {...props} icon={opt.icon} />}
+              />
+            ))}
+          </Dialog.Content>
+        </Dialog>
+      </Portal>
     </View>
   );
 }
@@ -148,35 +222,8 @@ function formatSize(bytes: number): string {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0d0d0d' },
-  center:    {
-    flex: 1,
-    backgroundColor: '#0d0d0d',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 24,
-  },
-  notice:    { color: '#aaaaaa', fontSize: 15, textAlign: 'center' },
-  header:    {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    padding: 12,
-    backgroundColor: '#111111',
-    borderBottomWidth: 1,
-    borderBottomColor: '#222222',
-  },
-  cwd:       { color: '#4fc3f7', fontSize: 14, fontFamily: 'monospace', flex: 1 },
-  refresh:   { color: '#aaaaaa', fontSize: 13, marginLeft: 8 },
-  error:     { color: '#ef5350', padding: 12, fontSize: 13 },
-  entry:     {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-  },
-  entryIcon: { color: '#555555', width: 20, fontSize: 12, fontFamily: 'monospace' },
-  entryName: { color: '#e0e0e0', fontSize: 15, flex: 1 },
-  entrySize: { color: '#666666', fontSize: 12, marginLeft: 8 },
-  separator: { height: 1, backgroundColor: '#1a1a1a', marginLeft: 36 },
+  flex:   { flex: 1 },
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
+  mono:   { fontFamily: 'monospace', fontSize: 13 },
+  size:   { alignSelf: 'center' },
 });
