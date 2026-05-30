@@ -73,7 +73,7 @@ terminal, file browser, system monitor, and custom API over WebSocket.`,
 
 	root.PersistentFlags().StringVar(&flagConfigDir, "config-dir", "",
 		"identity/token directory (default ~/.config/hostd or platform equivalent); use distinct dirs to run multiple independent hosts")
-	root.AddCommand(startCmd(), pairCmd(), statusCmd(), revokeCmd(), versionCmd())
+	root.AddCommand(startCmd(), pairCmd(), statusCmd(), revokeCmd(), versionCmd(), installCmd(), uninstallCmd())
 	return root
 }
 
