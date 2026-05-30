@@ -9,12 +9,14 @@ package dashboard
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"html/template"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/coder/websocket"
 	"rsc.io/qr"
 )
 
@@ -36,6 +38,21 @@ type SessionInfo struct {
 	Alive bool
 }
 
+// TermSession is a live attachment to one terminal session (decoupled from the
+// term package). Detach is called when the browser disconnects.
+type TermSession interface {
+	Write(p []byte) error
+	Resize(cols, rows uint16) error
+	Detach()
+}
+
+// TermAttacher bridges the dashboard's local web terminal to the session
+// Manager. onOutput/onExit are invoked from a background goroutine; the
+// returned scrollback is replayed into the browser first.
+type TermAttacher interface {
+	Attach(id string, onOutput func([]byte), onExit func()) (sess TermSession, scrollback []byte, err error)
+}
+
 // Server renders the dashboard. cmd wires the closures so we avoid importing
 // auth/term/store here (no cycles).
 type Server struct {
@@ -46,6 +63,7 @@ type Server struct {
 	Sessions     func() []SessionInfo         // live terminal sessions
 	Revoke       func(clientID string) error  // kick a device
 	Rename       func(clientID, name string) error
+	Term         TermAttacher                 // nil → no web terminal
 
 	mu     sync.Mutex
 	code   string    // current pairing code shown in the QR
@@ -64,6 +82,8 @@ func (s *Server) ListenAndServe(ctx context.Context, port string) error {
 	mux.HandleFunc("/api/code", s.handleCode)
 	mux.HandleFunc("/api/revoke", s.handleRevoke)
 	mux.HandleFunc("/api/rename", s.handleRename)
+	mux.HandleFunc("/term", s.handleTerm)
+	mux.HandleFunc("/term/ws", s.handleTermWS)
 
 	srv := &http.Server{Addr: "127.0.0.1:" + port, Handler: localOnly(mux)}
 	go func() {
@@ -171,6 +191,150 @@ func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(code.PNG())
 }
 
+// handleTerm serves the xterm.js page that attaches to one session over a local
+// WebSocket. Reachable only from loopback (the localOnly wrapper).
+func (s *Server) handleTerm(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" || s.Term == nil {
+		http.Error(w, "no terminal", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = termTmpl.Execute(w, map[string]any{"ID": id})
+}
+
+// handleTermWS bridges the browser xterm to a session: it attaches via s.Term,
+// streams output as binary frames, and applies input/resize from JSON text
+// frames ({"t":"i","d":<base64>} and {"t":"r","c":cols,"r":rows}).
+func (s *Server) handleTermWS(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" || s.Term == nil {
+		http.Error(w, "no terminal", http.StatusNotFound)
+		return
+	}
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	if err != nil {
+		return
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	out := make(chan []byte, 1024)
+	sess, scrollback, err := s.Term.Attach(id,
+		func(p []byte) {
+			b := append([]byte(nil), p...)
+			select {
+			case out <- b:
+			case <-ctx.Done():
+			}
+		},
+		cancel, // onExit
+	)
+	if err != nil {
+		c.Close(websocket.StatusInternalError, "attach failed")
+		return
+	}
+	defer sess.Detach()
+
+	// Writer goroutine: scrollback first, then live output as binary frames.
+	go func() {
+		if len(scrollback) > 0 {
+			if c.Write(ctx, websocket.MessageBinary, scrollback) != nil {
+				cancel()
+				return
+			}
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case b := <-out:
+				if c.Write(ctx, websocket.MessageBinary, b) != nil {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	// Reader loop: input + resize.
+	for {
+		typ, data, rerr := c.Read(ctx)
+		if rerr != nil {
+			break
+		}
+		if typ != websocket.MessageText {
+			continue
+		}
+		var m struct {
+			T string `json:"t"`
+			D string `json:"d"`
+			C uint16 `json:"c"`
+			R uint16 `json:"r"`
+		}
+		if json.Unmarshal(data, &m) != nil {
+			continue
+		}
+		switch m.T {
+		case "i":
+			if raw, derr := base64.StdEncoding.DecodeString(m.D); derr == nil {
+				_ = sess.Write(raw)
+			}
+		case "r":
+			if m.C > 0 && m.R > 0 {
+				_ = sess.Resize(m.C, m.R)
+			}
+		}
+	}
+	cancel()
+}
+
+var termTmpl = template.Must(template.New("term").Parse(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>session {{.ID}}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css"/>
+<style>html,body{margin:0;height:100%;background:#0d0d0d}#t{height:100vh}
+ .xterm-viewport{-webkit-overflow-scrolling:touch}</style>
+</head><body><div id="t"></div>
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/lib/xterm-addon-webgl.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-canvas@0.5.0/lib/xterm-addon-canvas.js"></script>
+<script>
+ var id = "{{.ID}}";
+ var term = new Terminal({theme:{background:'#0d0d0d',foreground:'#e0e0e0',cursor:'#4fc3f7'},
+   fontFamily:'Menlo,Monaco,"Courier New",monospace',fontSize:14,cursorBlink:true,
+   scrollback:5000,smoothScrollDuration:0});
+ var fit = new FitAddon.FitAddon(); term.loadAddon(fit);
+ term.open(document.getElementById('t'));
+ // GPU/Canvas renderer instead of the default DOM renderer (smoother render +
+ // scroll). Prefer WebGL; fall back to Canvas, then DOM if neither loads.
+ try { var gl = new WebglAddon.WebglAddon(); gl.onContextLoss(function(){ try{gl.dispose();}catch(_){} }); term.loadAddon(gl); }
+ catch(_) { try { term.loadAddon(new CanvasAddon.CanvasAddon()); } catch(__){} }
+ fit.fit();
+ var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+ var ws = new WebSocket(proto + '://' + location.host + '/term/ws?id=' + encodeURIComponent(id));
+ ws.binaryType = 'arraybuffer';
+ function send(o){ if(ws.readyState === 1) ws.send(JSON.stringify(o)); }
+ function enc(s){ return btoa(unescape(encodeURIComponent(s))); }
+ ws.onopen = function(){ send({t:'r', c:term.cols, r:term.rows}); term.focus(); };
+ // Coalesce a burst of output frames into one term.write per animation frame.
+ var pending = [], raf = null;
+ function flush(){ raf = null; if(!pending.length) return; var chunks = pending; pending = [];
+   var total = 0, i; for(i=0;i<chunks.length;i++) total += chunks[i].length;
+   var merged = new Uint8Array(total), off = 0;
+   for(i=0;i<chunks.length;i++){ merged.set(chunks[i], off); off += chunks[i].length; }
+   term.write(merged); }
+ ws.onmessage = function(e){
+   pending.push(typeof e.data === 'string' ? new TextEncoder().encode(e.data) : new Uint8Array(e.data));
+   if(raf === null) raf = requestAnimationFrame(flush); };
+ ws.onclose = function(){ term.write('\r\n\x1b[90m[disconnected]\x1b[0m\r\n'); };
+ term.onData(function(d){ send({t:'i', d:enc(d)}); });
+ window.addEventListener('resize', function(){ fit.fit(); send({t:'r', c:term.cols, r:term.rows}); });
+</script></body></html>`))
+
 var indexTmpl = template.Must(template.New("dash").Parse(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>hostd</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -222,10 +386,11 @@ var indexTmpl = template.Must(template.New("dash").Parse(`<!DOCTYPE html>
 
  <div class="card">
    <h1 style="font-size:15px">Sessions ({{len .Sessions}})</h1>
-   <table><tr><th>id</th><th>title</th><th>folder</th><th>state</th></tr>
+   <table><tr><th>id</th><th>title</th><th>folder</th><th>state</th><th></th></tr>
    {{range .Sessions}}<tr><td class="mono">{{.ID}}</td><td>{{.Title}}</td><td class="mono muted">{{.Cwd}}</td>
-     <td>{{if .Alive}}<span class="ok">alive</span>{{else}}<span class="off">stopped</span>{{end}}</td></tr>
-   {{else}}<tr><td colspan="4" class="empty">No sessions.</td></tr>{{end}}
+     <td>{{if .Alive}}<span class="ok">alive</span>{{else}}<span class="off">stopped</span>{{end}}</td>
+     <td>{{if .Alive}}<a class="btn" style="margin:0;padding:4px 12px;font-size:12px" href="/term?id={{.ID}}" target="_blank">open ▸</a>{{end}}</td></tr>
+   {{else}}<tr><td colspan="5" class="empty">No sessions.</td></tr>{{end}}
    </table>
  </div>
 

@@ -310,7 +310,38 @@ func buildDashboard(mgr *auth.Manager, sessions *term.Manager, wsURL string, pai
 			}
 			return out
 		},
+		Term: dashTerm{mgr: sessions},
 	}
+}
+
+// dashTerm adapts the terminal Manager to dashboard.TermAttacher so the local
+// dashboard can attach a browser xterm to a live session.
+type dashTerm struct{ mgr *term.Manager }
+
+type dashSub struct {
+	onOut  func([]byte)
+	onExit func()
+}
+
+func (d dashSub) Output(p []byte) { d.onOut(p) }
+func (d dashSub) Exit()           { d.onExit() }
+
+type dashSession struct {
+	s     *term.Session
+	subID int
+}
+
+func (d dashSession) Write(p []byte) error          { return d.s.Write(p) }
+func (d dashSession) Resize(cols, rows uint16) error { return d.s.Resize(cols, rows) }
+func (d dashSession) Detach()                        { d.s.Detach(d.subID) }
+
+func (a dashTerm) Attach(id string, onOutput func([]byte), onExit func()) (dashboard.TermSession, []byte, error) {
+	s, err := a.mgr.Attach(launcher.Profile{}, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	subID, scrollback := s.Attach(dashSub{onOut: onOutput, onExit: onExit})
+	return dashSession{s: s, subID: subID}, scrollback, nil
 }
 
 // openBrowser opens url in the default browser (best-effort, per OS).
