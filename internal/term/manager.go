@@ -189,10 +189,11 @@ func (s *Session) pump() {
 // Manager owns terminal sessions for the host process and (in dtach mode) the
 // on-disk session directory shared with the host's own `dtach` clients.
 type Manager struct {
-	launcher launcher.Launcher
-	sessDir  string
-	useDtach bool
-	store    *store.Store // durable session metadata (cwd) for `hostd restore`
+	launcher   launcher.Launcher
+	sessDir    string
+	useDtach   bool
+	store      *store.Store // durable session metadata (cwd) for `hostd restore`
+	shellrcDir string       // ZDOTDIR with a short-prompt .zshrc ("" = leave prompt)
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -202,11 +203,24 @@ type Manager struct {
 // NewManager returns a Manager. If useDtach, sessions are backed by dtach using
 // sockets under sessDir (created if missing); otherwise sessions are in-process.
 // st (may be nil) persists session metadata + cwd for restore-after-reboot.
-func NewManager(l launcher.Launcher, sessDir string, useDtach bool, st *store.Store) *Manager {
+// shellrcDir (may be empty) is a ZDOTDIR whose .zshrc sets a short prompt.
+func NewManager(l launcher.Launcher, sessDir string, useDtach bool, st *store.Store, shellrcDir string) *Manager {
 	if useDtach && sessDir != "" {
 		_ = os.MkdirAll(sessDir, 0o700)
 	}
-	return &Manager{launcher: l, sessDir: sessDir, useDtach: useDtach, store: st, sessions: make(map[string]*Session)}
+	return &Manager{launcher: l, sessDir: sessDir, useDtach: useDtach, store: st, shellrcDir: shellrcDir, sessions: make(map[string]*Session)}
+}
+
+// promptEnv returns env vars to apply a short prompt for shell. For zsh we point
+// ZDOTDIR at our short-prompt rc dir (which sources the user's ~/.zshrc first).
+func (m *Manager) promptEnv(shell string) []string {
+	if m.shellrcDir == "" {
+		return nil
+	}
+	if strings.Contains(filepath.Base(shell), "zsh") {
+		return []string{"ZDOTDIR=" + m.shellrcDir}
+	}
+	return nil
 }
 
 func (m *Manager) sockPath(id string) string { return filepath.Join(m.sessDir, id+".sock") }
@@ -259,6 +273,13 @@ func (m *Manager) Create(p launcher.Profile, cols, rows uint16, title string) (*
 		title = fmt.Sprintf("shell %d", n)
 	}
 
+	// Apply the short-prompt env (non-destructive copy of the profile).
+	shell := shellFor(p)
+	pp := p
+	if env := m.promptEnv(shell); env != nil {
+		pp.Env = append(append([]string{}, p.Env...), env...)
+	}
+
 	var pty launcher.Session
 	var err error
 	var sock string
@@ -267,10 +288,10 @@ func (m *Manager) Create(p launcher.Profile, cols, rows uint16, title string) (*
 		m.writeMeta(id, sessionMeta{ID: id, Title: title, Created: time.Now().Unix(), Cols: cols, Rows: rows})
 		// dtach -A: attach, creating the session (running the shell) if needed.
 		// -z: no suspend key; -r winch: redraw via SIGWINCH on (re)attach.
-		pty, err = m.launcher.StartCommand(p, launcher.Size{Cols: cols, Rows: rows},
-			"dtach", "-A", sock, "-z", "-r", "winch", shellFor(p))
+		pty, err = m.launcher.StartCommand(pp, launcher.Size{Cols: cols, Rows: rows},
+			"dtach", "-A", sock, "-z", "-r", "winch", shell)
 	} else {
-		pty, err = m.launcher.StartShell(p, launcher.Size{Cols: cols, Rows: rows})
+		pty, err = m.launcher.StartShell(pp, launcher.Size{Cols: cols, Rows: rows})
 	}
 	if err != nil {
 		if sock != "" {
@@ -539,7 +560,7 @@ func procCwd(pid string) string {
 // running (e.g. after a reboot): for each it spawns a fresh dtach master running
 // the shell in the session's saved working directory, and writes the socket-meta
 // file so a running daemon lists it. Returns the rows it restored.
-func RestoreFromStore(sessDir, shell string, st *store.Store) ([]store.SessionRow, error) {
+func RestoreFromStore(sessDir, shell, shellrcDir string, st *store.Store) ([]store.SessionRow, error) {
 	if shell == "" {
 		shell = shellFor(launcher.Profile{})
 	}
@@ -566,6 +587,9 @@ func RestoreFromStore(sessDir, shell string, st *store.Store) ([]store.SessionRo
 		cmd := exec.Command("dtach", "-n", sock, "-z", shell)
 		cmd.Dir = cwd
 		cmd.Env = os.Environ()
+		if shellrcDir != "" && strings.Contains(filepath.Base(shell), "zsh") {
+			cmd.Env = append(cmd.Env, "ZDOTDIR="+shellrcDir)
+		}
 		if err := cmd.Start(); err != nil {
 			continue
 		}
