@@ -15,11 +15,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/famgia/remote-host/internal/channel"
 	"github.com/famgia/remote-host/internal/protocol"
@@ -57,6 +59,8 @@ func (h *Handler) Handle(ctx context.Context, e protocol.Envelope, c channel.Con
 		return h.handleRead(ctx, e, c)
 	case "write":
 		return h.handleWrite(ctx, e, c)
+	case "upload":
+		return h.handleUpload(ctx, e, c)
 	case "mkdir":
 		return h.handleMkdir(ctx, e, c)
 	case "delete":
@@ -78,6 +82,21 @@ type pathReq struct {
 type writeReq struct {
 	Path    string `json:"path"`
 	Content string `json:"content"` // base64-encoded
+}
+
+// uploadReq is the request payload for the "upload" operation. Unlike "write",
+// the client does not choose the destination path: the handler picks a unique
+// name inside the app-managed uploads directory and returns the resulting host
+// path, which the caller can then paste into a terminal session.
+type uploadReq struct {
+	Name    string `json:"name"`    // original file name (basename only is used)
+	Content string `json:"content"` // base64-encoded
+}
+
+// uploadResp is the response payload for "upload": the absolute host path the
+// bytes were written to.
+type uploadResp struct {
+	Path string `json:"path"`
 }
 
 // entry is a directory entry or stat result.
@@ -405,6 +424,115 @@ func (h *Handler) handleWrite(_ context.Context, e protocol.Envelope, c channel.
 	}
 
 	return sendOK(c, e.Type, e.ID, okResp{OK: true})
+}
+
+// handleUpload writes client-supplied bytes into the app-managed uploads
+// directory under a unique, sanitized name and returns the resulting host path.
+//
+// The path is anchored to the connection's sandbox root when the profile has
+// one (so a sandboxed client cannot drop files outside its boundary), and to
+// ~/.remote-host/uploads for admin profiles. The returned path is absolute so
+// the caller can paste it straight into a terminal running on the same host.
+func (h *Handler) handleUpload(_ context.Context, e protocol.Envelope, c channel.Conn) error {
+	var req uploadReq
+	if err := json.Unmarshal(e.Data, &req); err != nil {
+		return sendErr(c, e.Type, e.ID, fmt.Sprintf("fs: invalid request: %v", err))
+	}
+
+	data, err := base64.StdEncoding.DecodeString(req.Content)
+	if err != nil {
+		return sendErr(c, e.Type, e.ID, fmt.Sprintf("fs: upload: invalid base64 content: %v", err))
+	}
+
+	dir, err := uploadsDir(c.Profile().Root)
+	if err != nil {
+		return sendErr(c, e.Type, e.ID, err.Error())
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return sendErr(c, e.Type, e.ID, fmt.Sprintf("fs: upload: mkdir %s: %v", dir, err))
+	}
+
+	abs, err := createUploadFile(dir, req.Name, data)
+	if err != nil {
+		return sendErr(c, e.Type, e.ID, fmt.Sprintf("fs: upload: %v", err))
+	}
+
+	return sendOK(c, e.Type, e.ID, uploadResp{Path: abs})
+}
+
+// uploadsDir returns the directory uploads are stored in: <root>/.uploads when
+// the profile is sandboxed, else ~/.remote-host/uploads for admin profiles.
+func uploadsDir(root string) (string, error) {
+	if root != "" {
+		cleanRoot, err := resolveRoot(root)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(cleanRoot, ".uploads"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("fs: upload: cannot determine home directory: %w", err)
+	}
+	return filepath.Join(home, ".remote-host", "uploads"), nil
+}
+
+// maxUploadAttempts bounds the O_EXCL retry loop in createUploadFile so a
+// pathological collision (or a dir full of matching names) fails loudly instead
+// of spinning forever.
+const maxUploadAttempts = 100
+
+// createUploadFile writes data to a freshly created, never-pre-existing file in
+// dir and returns its absolute path. The name is "<unixnano>-<base>" (and
+// "<unixnano>-<n>-<base>" on the n-th collision), where base is the sanitized
+// basename of the client-supplied name.
+//
+// The file is opened with O_CREATE|O_EXCL so two concurrent uploads that pick
+// the same timestamp can never clobber each other: the loser gets ErrExist and
+// retries with the next counter. A partial write leaves no file behind.
+func createUploadFile(dir, name string, data []byte) (string, error) {
+	base := sanitizeUploadBase(name)
+	ts := time.Now().UnixNano()
+	for attempt := 0; attempt < maxUploadAttempts; attempt++ {
+		candidate := fmt.Sprintf("%d-%s", ts, base)
+		if attempt > 0 {
+			candidate = fmt.Sprintf("%d-%d-%s", ts, attempt, base)
+		}
+		abs := filepath.Join(dir, candidate)
+
+		f, err := os.OpenFile(abs, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue // name taken by a concurrent upload — try the next one
+			}
+			return "", fmt.Errorf("create %s: %w", abs, err)
+		}
+
+		if _, werr := f.Write(data); werr != nil {
+			_ = f.Close()
+			_ = os.Remove(abs) // don't leave a half-written file around
+			return "", fmt.Errorf("write %s: %w", abs, werr)
+		}
+		if cerr := f.Close(); cerr != nil {
+			_ = os.Remove(abs)
+			return "", fmt.Errorf("close %s: %w", abs, cerr)
+		}
+		return abs, nil
+	}
+	return "", fmt.Errorf("could not allocate a unique name in %s after %d attempts", dir, maxUploadAttempts)
+}
+
+// sanitizeUploadBase reduces a client-supplied name to a safe single path
+// element: directory components and path separators are stripped (so the result
+// always stays inside the uploads dir), and a blank or unsafe name falls back to
+// "upload".
+func sanitizeUploadBase(name string) string {
+	base := filepath.Base(filepath.Clean(strings.ReplaceAll(name, "\\", "/")))
+	base = strings.TrimSpace(base)
+	if base == "" || base == "." || base == ".." || base == string(filepath.Separator) {
+		base = "upload"
+	}
+	return base
 }
 
 func (h *Handler) handleMkdir(_ context.Context, e protocol.Envelope, c channel.Conn) error {

@@ -38,6 +38,12 @@
           "cameraPermission": "Allow remote-host to access your camera to scan the pairing QR code."
         }
       ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow remote-host to access your photos so you can send an image to the terminal."
+        }
+      ],
       "expo-secure-store"
     ],
     "experiments": {

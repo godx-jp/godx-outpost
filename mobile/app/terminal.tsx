@@ -19,7 +19,7 @@
 
 import { useFocusEffect } from 'expo-router';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { FlatList, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, StyleSheet, View } from 'react-native';
 import { Appbar, Button, Divider, IconButton, List, Text } from 'react-native-paper';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import { BinaryKind, Ch, type Envelope } from '../lib/protocol';
@@ -36,6 +36,12 @@ function utf8Bytes(s: string): Uint8Array {
   return bytes;
 }
 
+// Single-quote a path for a POSIX shell so spaces/special chars survive being
+// typed at the prompt. A literal single quote is closed, escaped, and reopened.
+function shellQuote(p: string): string {
+  return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
 interface SessionInfo {
   id: string; title: string; cols: number; rows: number; alive: boolean; created: number;
 }
@@ -49,21 +55,39 @@ const TERMINAL_HTML = `<!DOCTYPE html>
   <style>
     html, body { margin: 0; padding: 0; background: #0d0d0d; height: 100%; overflow: hidden; }
     #terminal  { height: 100vh; }
+    /* Give the scrollback viewport native momentum scrolling on iOS WKWebView. */
+    .xterm-viewport { -webkit-overflow-scrolling: touch; }
   </style>
 </head>
 <body>
   <div id="terminal"></div>
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/lib/xterm-addon-webgl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-canvas@0.5.0/lib/xterm-addon-canvas.js"></script>
   <script>
     const term = new Terminal({
       theme: { background: '#0d0d0d', foreground: '#e0e0e0', cursor: '#4fc3f7' },
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
       fontSize: 14, cursorBlink: true,
+      scrollback: 5000,          // more history to scroll through
+      smoothScrollDuration: 0,   // instant scroll — avoids a laggy feel
     });
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
     term.open(document.getElementById('terminal'));
+
+    // Use a GPU/Canvas renderer instead of the default DOM renderer — this is
+    // the biggest smoothness win. Prefer WebGL; fall back to Canvas, then to the
+    // DOM renderer if neither loads (e.g. no GL context in this WebView).
+    try {
+      const gl = new WebglAddon.WebglAddon();
+      gl.onContextLoss(() => { try { gl.dispose(); } catch (_) {} });
+      term.loadAddon(gl);
+    } catch (_) {
+      try { term.loadAddon(new CanvasAddon.CanvasAddon()); } catch (__) {}
+    }
+
     fitAddon.fit();
 
     function post(obj) { window.ReactNativeWebView.postMessage(JSON.stringify(obj)); }
@@ -101,6 +125,7 @@ export default function TerminalScreen() {
   const [activeId, setActiveId]   = useState<string | null>(null);
   const [creating, setCreating]   = useState(false);
   const [landscape, setLandscape] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const authed = useAuthed();
 
   const webviewRef = useRef<WebView>(null);
@@ -110,6 +135,12 @@ export default function TerminalScreen() {
   creatingRef.current = creating;
   const createTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 80, rows: 24 });
+  // Output coalescing: terminal output arrives as many small binary frames.
+  // Injecting each one across the RN↔WebView bridge separately is the main
+  // source of scroll/render jank under heavy output. Instead we accumulate
+  // payloads and flush them in ONE injectJavaScript per animation frame.
+  const outChunksRef = useRef<Uint8Array[]>([]);
+  const outFlushRef = useRef<number | null>(null);
   // Host this screen last showed sessions for; used to detect a host switch.
   const lastHostRef = useRef<string | null>(wsClient.activeHostId);
   // Command to run in the session currently being launched (Files long-press),
@@ -206,13 +237,27 @@ export default function TerminalScreen() {
       }
     };
 
-    const prevBin = wsClient.onBinary;
-    wsClient.onBinary = (frame) => {
-      prevBin?.(frame);
-      if (frame.kind !== BinaryKind.TermOutput) return;
-      if (frame.streamID !== activeIdRef.current) return;
+    // Flush all pending output payloads in ONE bridge crossing: concatenate the
+    // queued chunks, base64-encode once, and inject a single __termWrite. Called
+    // on an animation frame so a burst of frames coalesces into one DOM update.
+    const flushOut = () => {
+      outFlushRef.current = null;
+      const chunks = outChunksRef.current;
+      if (chunks.length === 0) return;
+      outChunksRef.current = [];
+
+      let total = 0;
+      for (const c of chunks) total += c.length;
+      const merged = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { merged.set(c, off); off += c.length; }
+
+      // Build the binary string in 32KiB slices so String.fromCharCode.apply
+      // doesn't blow the argument/stack limit on large bursts.
       let bin = '';
-      frame.payload.forEach((b) => (bin += String.fromCharCode(b)));
+      for (let i = 0; i < merged.length; i += 0x8000) {
+        bin += String.fromCharCode.apply(null, Array.from(merged.subarray(i, i + 0x8000)));
+      }
       const b64 = btoa(bin);
       // Guard __termWrite: a frame can arrive in the brief window before the
       // WebView has loaded xterm.js and defined the function. Skipping it then
@@ -222,11 +267,29 @@ export default function TerminalScreen() {
       );
     };
 
+    const prevBin = wsClient.onBinary;
+    wsClient.onBinary = (frame) => {
+      prevBin?.(frame);
+      if (frame.kind !== BinaryKind.TermOutput) return;
+      if (frame.streamID !== activeIdRef.current) return;
+      // Queue the payload; flush once per animation frame (RN gives a fresh
+      // buffer per WS message, so holding the reference until flush is safe).
+      outChunksRef.current.push(frame.payload);
+      if (outFlushRef.current == null) {
+        outFlushRef.current = requestAnimationFrame(flushOut);
+      }
+    };
+
     refreshList();
 
     return () => {
       wsClient.onEnvelope = prevEnv;
       wsClient.onBinary = prevBin;
+      if (outFlushRef.current != null) {
+        cancelAnimationFrame(outFlushRef.current);
+        outFlushRef.current = null;
+      }
+      outChunksRef.current = [];
     };
   }, [authed, refreshList]);
 
@@ -286,6 +349,69 @@ export default function TerminalScreen() {
     );
   }, []);
 
+  // Upload a base64 blob to the host, then type its returned host path into the
+  // active session (shell-quoted, no Enter) so the user can finish the command —
+  // e.g. reference an image with a tool running in the terminal. The PTY runs on
+  // the host, so the returned path is directly usable there.
+  const uploadAndPaste = useCallback(async (name: string, base64: string) => {
+    const id = activeIdRef.current;
+    if (!id || !base64) return;
+    setUploading(true);
+    try {
+      const path = await wsClient.fsUpload(name, base64);
+      sendKeys(Array.from(utf8Bytes(`${shellQuote(path)} `)));
+    } catch (e) {
+      wsClient.onError?.(`Upload failed: ${(e as Error).message}`);
+    } finally {
+      setUploading(false);
+    }
+  }, [sendKeys]);
+
+  // Attach button → pick an image from the library or any file, read its bytes
+  // as base64, then upload+paste. Pickers are NATIVE modules: lazy-import and
+  // surface failures rather than crashing the screen on builds without them.
+  const pickImage = useCallback(async () => {
+    try {
+      const ImagePicker = await import('expo-image-picker');
+      const res = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        quality: 1,
+        base64: true,
+      });
+      if (res.canceled || !res.assets?.length) return;
+      const a = res.assets[0];
+      if (!a.base64) { wsClient.onError?.('Could not read image bytes.'); return; }
+      await uploadAndPaste(a.fileName ?? 'image.jpg', a.base64);
+    } catch (e) {
+      wsClient.onError?.(`Image picker unavailable: ${(e as Error).message}`);
+    }
+  }, [uploadAndPaste]);
+
+  const pickFile = useCallback(async () => {
+    try {
+      const DocumentPicker = await import('expo-document-picker');
+      const FileSystem = await import('expo-file-system');
+      const res = await DocumentPicker.getDocumentAsync({ copyToCacheDirectory: true });
+      if (res.canceled || !res.assets?.length) return;
+      const a = res.assets[0];
+      const base64 = await FileSystem.readAsStringAsync(a.uri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      await uploadAndPaste(a.name ?? 'file', base64);
+    } catch (e) {
+      wsClient.onError?.(`File picker unavailable: ${(e as Error).message}`);
+    }
+  }, [uploadAndPaste]);
+
+  const onAttach = useCallback(() => {
+    if (uploading) return;
+    Alert.alert('Attach to terminal', 'Upload to the host and paste its path.', [
+      { text: 'Photo / Image', onPress: pickImage },
+      { text: 'File', onPress: pickFile },
+      { text: 'Cancel', style: 'cancel' },
+    ]);
+  }, [uploading, pickImage, pickFile]);
+
   const handleWebViewMessage = (event: WebViewMessageEvent) => {
     let msg: { type: string; data?: string; cols?: number; rows?: number };
     try { msg = JSON.parse(event.nativeEvent.data); } catch { return; }
@@ -334,6 +460,11 @@ export default function TerminalScreen() {
         <Appbar.Header mode="small">
           <Appbar.BackAction onPress={leaveToList} />
           <Appbar.Content title={activeId} titleStyle={styles.mono} />
+          {uploading ? (
+            <ActivityIndicator style={styles.uploadSpin} color="#4fc3f7" />
+          ) : (
+            <Appbar.Action icon="paperclip" onPress={onAttach} />
+          )}
           <Appbar.Action
             icon={landscape ? 'phone-rotate-portrait' : 'phone-rotate-landscape'}
             onPress={toggleOrientation}
@@ -350,6 +481,8 @@ export default function TerminalScreen() {
           keyboardDisplayRequiresUserAction={false}
           automaticallyAdjustContentInsets={false}
           contentInsetAdjustmentBehavior="never"
+          decelerationRate="normal"
+          overScrollMode="never"
         />
         <TermToolbar onKey={sendKeys} />
       </View>
@@ -406,4 +539,5 @@ const styles = StyleSheet.create({
   mono:    { fontFamily: 'monospace', fontSize: 13 },
   newBtn: { margin: 16 },
   empty:  { textAlign: 'center', marginTop: 40, paddingHorizontal: 24 },
+  uploadSpin: { marginHorizontal: 14 },
 });

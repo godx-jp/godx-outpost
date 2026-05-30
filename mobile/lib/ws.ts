@@ -328,6 +328,19 @@ export class Client {
   }
 
   /**
+   * Upload a file's bytes to the host's app-managed uploads directory (fs/upload)
+   * and resolve with the absolute host path it was written to. The host chooses a
+   * unique name; `name` is only a hint used for the suffix. `contentB64` is the
+   * file's raw bytes, base64-encoded.
+   */
+  async fsUpload(name: string, contentB64: string): Promise<string> {
+    const res = await this._request<{ name: string; content: string }, { path: string }>(
+      Ch.FS, 'upload', { name, content: contentB64 },
+    );
+    return res.path;
+  }
+
+  /**
    * Send a JSON envelope over the WebSocket text frame.
    * Throws if the socket is not open.
    */
