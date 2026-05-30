@@ -21,6 +21,8 @@ func installCmd() *cobra.Command {
 	var bind, port string
 	var pairTTL time.Duration
 	var restore bool
+	var advertise, dashPort string
+	var doOpen bool
 	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install outpost as a login service (launchd on macOS, systemd --user on Linux)",
@@ -40,6 +42,18 @@ token is revoked).`,
 			if restore {
 				runArgs = append(runArgs, "--restore") // auto re-open saved sessions after a reboot
 			}
+			// Bake the advertised URL into the service so the pairing QR is
+			// reachable from the phone (essential for a remote machine — the bind
+			// address alone is useless to the client).
+			if advertise != "" {
+				runArgs = append(runArgs, "--advertise", advertise)
+			}
+			if doOpen {
+				runArgs = append(runArgs, "--open") // run the local dashboard (QR + devices)
+			}
+			if dashPort != "" {
+				runArgs = append(runArgs, "--dashboard-port", dashPort)
+			}
 			if flagConfigDir != "" {
 				runArgs = append(runArgs, "--config-dir", flagConfigDir)
 			}
@@ -58,6 +72,9 @@ token is revoked).`,
 	cmd.Flags().StringVar(&port, "port", "8722", "listen port")
 	cmd.Flags().DurationVar(&pairTTL, "pair-ttl", 2*time.Minute, "pairing code lifetime")
 	cmd.Flags().BoolVar(&restore, "restore", true, "auto re-open saved sessions on each startup (after a reboot); --restore=false to disable")
+	cmd.Flags().StringVar(&advertise, "advertise", "", "URL embedded in the pairing QR that the phone connects to (e.g. ws://<tailscale-ip>:8722); required for a remote machine")
+	cmd.Flags().BoolVar(&doOpen, "open", false, "run the local web dashboard (QR + devices) as part of the service")
+	cmd.Flags().StringVar(&dashPort, "dashboard-port", "", "dashboard port on 127.0.0.1 (default: listen port + 1000)")
 	return cmd
 }
 
