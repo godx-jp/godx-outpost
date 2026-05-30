@@ -75,6 +75,22 @@ outpost install --bind 0.0.0.0 --port 8722 --advertise ws://192.168.1.50:8722 --
 
 Bind to `0.0.0.0` for LAN/Tailscale, or keep `127.0.0.1` and front it with a tunnel. The **dashboard** is always bound to `127.0.0.1` only.
 
+### TLS (`wss://`)
+
+For a public/untrusted network, encrypt the transport. Two ways:
+
+- **Built-in TLS:** give outpost a **CA-trusted** certificate (e.g. Let's Encrypt / Caddy / `mkcert` on a domain the device trusts) and it serves `wss://`:
+  ```sh
+  outpost start --bind 0.0.0.0 --port 8722 \
+    --tls-cert /etc/letsencrypt/live/outpost.example.com/fullchain.pem \
+    --tls-key  /etc/letsencrypt/live/outpost.example.com/privkey.pem \
+    --advertise wss://outpost.example.com:8722
+  ```
+  TLS 1.2+ only. **Self-signed certs won't work** — iOS rejects them; use a trusted cert or the proxy option below.
+- **TLS-terminating proxy:** put Caddy (auto-HTTPS) / nginx / a Cloudflare Tunnel in front and keep outpost on `ws://127.0.0.1`; advertise `wss://your.domain`.
+
+Over **Tailscale** the link is already encrypted (WireGuard), so `ws://` is fine there — add `wss://` when you expose a public hostname.
+
 ---
 
 ## CLI reference
@@ -102,6 +118,7 @@ outpost version
 | `--restore` | `true` | Re-open saved sessions on startup. |
 | `--open` | `false` | Run the local web dashboard (QR + devices). |
 | `--dashboard-port` | `port+1000` | Dashboard port (127.0.0.1 only). |
+| `--tls-cert` / `--tls-key` | _(off)_ | Serve `wss://` with a CA-trusted cert + key (PEM). |
 | `--prompt` | _(start only)_ | Short shell prompt for sessions. |
 | `--config-dir` | OS config dir | Identity/token/sessions dir. **Distinct dirs = distinct hosts.** |
 

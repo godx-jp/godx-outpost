@@ -23,6 +23,7 @@ func installCmd() *cobra.Command {
 	var restore bool
 	var advertise, dashPort string
 	var doOpen bool
+	var tlsCert, tlsKey string
 	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install outpost as a login service (launchd on macOS, systemd --user on Linux)",
@@ -54,6 +55,9 @@ token is revoked).`,
 			if dashPort != "" {
 				runArgs = append(runArgs, "--dashboard-port", dashPort)
 			}
+			if tlsCert != "" && tlsKey != "" {
+				runArgs = append(runArgs, "--tls-cert", tlsCert, "--tls-key", tlsKey)
+			}
 			if flagConfigDir != "" {
 				runArgs = append(runArgs, "--config-dir", flagConfigDir)
 			}
@@ -75,6 +79,8 @@ token is revoked).`,
 	cmd.Flags().StringVar(&advertise, "advertise", "", "URL embedded in the pairing QR that the phone connects to (e.g. ws://<tailscale-ip>:8722); required for a remote machine")
 	cmd.Flags().BoolVar(&doOpen, "open", false, "run the local web dashboard (QR + devices) as part of the service")
 	cmd.Flags().StringVar(&dashPort, "dashboard-port", "", "dashboard port on 127.0.0.1 (default: listen port + 1000)")
+	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "path to a CA-trusted TLS certificate (PEM) to serve wss://; set with --tls-key")
+	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "path to the TLS private key (PEM) for --tls-cert")
 	return cmd
 }
 

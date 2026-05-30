@@ -137,6 +137,7 @@ func startCmd() *cobra.Command {
 	var doOpen bool
 	var dashPort string
 	var promptFlag string
+	var tlsCert, tlsKey string
 
 	cmd := &cobra.Command{
 		Use:   "start",
@@ -151,11 +152,22 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 			}
 			defer mgr.Close()
 
+			// TLS (wss://) requires both cert and key. Transport encryption on top
+			// of the in-band token auth — recommended over any untrusted network.
+			if (tlsCert == "") != (tlsKey == "") {
+				return fmt.Errorf("--tls-cert and --tls-key must be set together")
+			}
+			tlsOn := tlsCert != "" && tlsKey != ""
+			scheme := "ws"
+			if tlsOn {
+				scheme = "wss"
+			}
+
 			addr := bind + ":" + port
 			// The URL embedded in the QR must be reachable by the client. When
 			// binding 0.0.0.0 (all interfaces) the bind address is useless to a
 			// phone, so let the user advertise the real LAN/relay URL.
-			wsURL := "ws://" + addr
+			wsURL := scheme + "://" + addr
 			if advertise != "" {
 				wsURL = advertise
 			}
@@ -202,6 +214,11 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 			// Build the WebSocket server. The handler factory runs fresh per
 			// connection; only the terminal Manager is shared.
 			srv := server.New(mgr, makeHandlersFunc(sessions))
+			if tlsOn {
+				fmt.Printf("TLS             : enabled (wss) — cert %s\n", tlsCert)
+			} else {
+				fmt.Println("TLS             : off (ws) — use --tls-cert/--tls-key, a TLS proxy, or a private network (Tailscale)")
+			}
 
 			// Print the pairing QR before blocking.
 			pairingBlock(mgr, wsURL, pairTTL)
@@ -235,7 +252,7 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 				go openBrowser(dashURL)
 			}
 
-			if err := srv.ListenAndServe(ctx, addr); err != nil {
+			if err := srv.ListenAndServe(ctx, addr, tlsCert, tlsKey); err != nil {
 				return fmt.Errorf("serve: %w", err)
 			}
 			return nil
@@ -250,6 +267,8 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 	cmd.Flags().BoolVar(&doOpen, "open", false, "start a local web dashboard (QR + devices + sessions) and open it in the browser")
 	cmd.Flags().StringVar(&dashPort, "dashboard-port", "", "dashboard port on 127.0.0.1 (default: listen port + 1000)")
 	cmd.Flags().StringVar(&promptFlag, "prompt", "%1~ $ ", "short zsh PROMPT for sessions (drops the long user@host); empty leaves the shell's own prompt")
+	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "path to a TLS certificate (PEM) to serve wss:// — must be a CA-trusted cert (e.g. Let's Encrypt); set with --tls-key")
+	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "path to the TLS private key (PEM) for --tls-cert")
 	return cmd
 }
 

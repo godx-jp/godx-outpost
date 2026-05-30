@@ -8,6 +8,7 @@ Outpost gives a paired phone a **shell on the host as the user running the daemo
 - **Single-user host assumption.** State (signing key, sockets) is protected by file permissions (`identity.json` 0600, session dir 0700). On a shared/multi-user machine, a local user who can read those files or reach the dtach sockets can impersonate the host or attach to a session. Run it on a machine you control.
 - **The signing key is the crown jewel.** `identity.json` holds the HS256 key that signs every token; anyone who reads it can forge admin tokens. It's stored 0600 in the config dir (outside the repo) and the mode is re-tightened on load. Back it up like an SSH private key.
 - **Bind narrowly.** Prefer `--bind 127.0.0.1` + a tunnel, or a private network (Tailscale). Only bind `0.0.0.0` on a trusted LAN. The pairing code is the only thing standing between the network and access during a pairing window — keep windows short (`--pair-ttl`).
+- **Encrypt the transport on untrusted networks.** Over a public hostname, serve `wss://` — either built-in (`--tls-cert`/`--tls-key`, CA-trusted cert, TLS 1.2+) or via a TLS-terminating proxy (Caddy/Cloudflare). The token handshake authenticates the client but does not encrypt the channel; `ws://` is acceptable only on loopback or an already-encrypted overlay (Tailscale/WireGuard). Self-signed certs are rejected by iOS — use a trusted cert.
 
 ## How access is controlled
 

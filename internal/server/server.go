@@ -15,6 +15,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -122,7 +123,14 @@ func (s *Server) bindClient(c *conn, access string) {
 // ListenAndServe runs an http.Server on addr that upgrades requests to
 // WebSocket and serves each connection until it closes. It returns when the
 // underlying http.Server stops; cancelling ctx triggers a graceful shutdown.
-func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
+//
+// When certFile and keyFile are both set, it serves over TLS (wss://) with a
+// modern config (TLS 1.2+). Transport encryption is on top of the in-band token
+// auth: use it whenever the daemon is reachable over an untrusted network
+// (a public domain). Over an already-encrypted overlay like Tailscale it is
+// optional. A trusted certificate (e.g. Let's Encrypt) is required for the
+// mobile client to connect — self-signed certs are rejected by iOS.
+func (s *Server) ListenAndServe(ctx context.Context, addr, certFile, keyFile string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -136,7 +144,11 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		s.serveConn(ctx, c)
 	})
 
+	tlsEnabled := certFile != "" && keyFile != ""
 	httpSrv := &http.Server{Addr: addr, Handler: mux}
+	if tlsEnabled {
+		httpSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
 
 	// Tie shutdown to ctx: when the caller cancels, gracefully stop the server
 	// so ListenAndServe can return.
@@ -146,7 +158,12 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		_ = httpSrv.Shutdown(context.Background())
 	}()
 
-	err := httpSrv.ListenAndServe()
+	var err error
+	if tlsEnabled {
+		err = httpSrv.ListenAndServeTLS(certFile, keyFile)
+	} else {
+		err = httpSrv.ListenAndServe()
+	}
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
