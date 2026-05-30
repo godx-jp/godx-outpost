@@ -148,6 +148,9 @@ export function TermToolbar({ onKey }: { onKey: (bytes: number[]) => void }) {
               <Pressable style={[styles.dkey, styles.dRight]} onPress={() => onKey(RIGHT)}>
                 <MaterialCommunityIcons name="chevron-right" size={26} color="#e0e0e0" />
               </Pressable>
+              <Pressable style={[styles.dkey, styles.dCenter]} onPress={() => onKey([CR])}>
+                <MaterialCommunityIcons name="keyboard-return" size={22} color="#e0e0e0" />
+              </Pressable>
               <Pressable style={[styles.dkey, styles.dDown]} onPress={() => onKey(DOWN)}>
                 <MaterialCommunityIcons name="chevron-down" size={26} color="#e0e0e0" />
               </Pressable>
@@ -194,4 +197,5 @@ const styles = StyleSheet.create({
   dDown: { bottom: 0, left: 47 },
   dLeft: { left: 0, top: 47 },
   dRight: { right: 0, top: 47 },
+  dCenter: { top: 47, left: 47, backgroundColor: '#3a3a3a' },
 });
