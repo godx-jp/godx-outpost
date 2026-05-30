@@ -23,8 +23,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/famgia/remote-host/internal/channel"
-	"github.com/famgia/remote-host/internal/protocol"
+	"github.com/godx-jp/godx-outpost/internal/channel"
+	"github.com/godx-jp/godx-outpost/internal/protocol"
 )
 
 // largFileThreshold is the byte size above which "read" responses are streamed

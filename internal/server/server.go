@@ -24,10 +24,10 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/famgia/remote-host/internal/auth"
-	"github.com/famgia/remote-host/internal/channel"
-	"github.com/famgia/remote-host/internal/launcher"
-	"github.com/famgia/remote-host/internal/protocol"
+	"github.com/godx-jp/godx-outpost/internal/auth"
+	"github.com/godx-jp/godx-outpost/internal/channel"
+	"github.com/godx-jp/godx-outpost/internal/launcher"
+	"github.com/godx-jp/godx-outpost/internal/protocol"
 )
 
 // Server is the WebSocket hub. It is safe to use a single Server for many
@@ -112,6 +112,11 @@ func (s *Server) bindClient(c *conn, access string) {
 	cid := s.mgr.ClientIDFromAccess(access)
 	c.setClientID(cid)
 	s.register(cid, c)
+	// Close the revoke race: if the device was revoked between VerifyAccess and
+	// register (so the revoke's kick missed this conn), drop it now.
+	if !s.mgr.DeviceActive(cid) {
+		_ = c.ws.CloseNow()
+	}
 }
 
 // ListenAndServe runs an http.Server on addr that upgrades requests to

@@ -33,16 +33,16 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/famgia/remote-host/internal/auth"
-	"github.com/famgia/remote-host/internal/channel"
-	"github.com/famgia/remote-host/internal/customapi"
-	"github.com/famgia/remote-host/internal/dashboard"
-	fs "github.com/famgia/remote-host/internal/fs"
-	"github.com/famgia/remote-host/internal/launcher"
-	"github.com/famgia/remote-host/internal/qr"
-	"github.com/famgia/remote-host/internal/server"
-	"github.com/famgia/remote-host/internal/sys"
-	"github.com/famgia/remote-host/internal/term"
+	"github.com/godx-jp/godx-outpost/internal/auth"
+	"github.com/godx-jp/godx-outpost/internal/channel"
+	"github.com/godx-jp/godx-outpost/internal/customapi"
+	"github.com/godx-jp/godx-outpost/internal/dashboard"
+	fs "github.com/godx-jp/godx-outpost/internal/fs"
+	"github.com/godx-jp/godx-outpost/internal/launcher"
+	"github.com/godx-jp/godx-outpost/internal/qr"
+	"github.com/godx-jp/godx-outpost/internal/server"
+	"github.com/godx-jp/godx-outpost/internal/sys"
+	"github.com/godx-jp/godx-outpost/internal/term"
 )
 
 // version is the outpost build version. Overridable at build time with

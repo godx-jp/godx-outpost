@@ -1,6 +1,6 @@
 # GoReleaser config for the `outpost` daemon.
 # Builds all platforms, publishes a GitHub Release, and updates a Homebrew tap
-# (famgia/homebrew-tap) + .deb/.rpm packages — so users install via a package
+# (godx-jp/homebrew-tap) + .deb/.rpm packages — so users install via a package
 # manager instead of copying binaries.
 #
 # Cut a release:   git tag v0.1.0 && git push origin v0.1.0   (CI runs goreleaser)
@@ -32,15 +32,15 @@ archives:
 checksum:
   name_template: checksums.txt
 
-# Homebrew (macOS): `brew install famgia/tap/outpost`.
+# Homebrew (macOS): `brew install godx-jp/tap/outpost`.
 homebrew_casks:
   - name: outpost
     repository:
-      owner: famgia
+      owner: godx-jp
       name: homebrew-tap
       token: "{{ .Env.TAP_GITHUB_TOKEN }}" # PAT with write access to the tap repo
     directory: Casks
-    homepage: "https://github.com/famgia/remote-host"
+    homepage: "https://github.com/godx-jp/godx-outpost"
     description: "Outpost — remote-access host daemon (terminal/files/monitor over WebSocket)"
     # Strip the Gatekeeper quarantine flag so the freshly downloaded binary runs.
     hooks:
@@ -64,5 +64,5 @@ nfpms:
 
 release:
   github:
-    owner: famgia
-    name: remote-host
+    owner: godx-jp
+    name: godx-outpost

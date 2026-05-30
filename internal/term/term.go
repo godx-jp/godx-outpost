@@ -8,8 +8,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/famgia/remote-host/internal/channel"
-	"github.com/famgia/remote-host/internal/protocol"
+	"github.com/godx-jp/godx-outpost/internal/channel"
+	"github.com/godx-jp/godx-outpost/internal/protocol"
 )
 
 // Handler is the per-connection adapter to the shared session Manager. It

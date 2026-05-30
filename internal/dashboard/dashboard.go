@@ -156,21 +156,41 @@ func (s *Server) spaHandler() http.Handler {
 }
 
 // localOnly rejects any request that didn't originate from the loopback host.
+// It enforces TWO conditions:
+//   - the TCP peer is loopback (RemoteAddr), and
+//   - the Host header is loopback — without this, a malicious website using DNS
+//     rebinding (its domain resolving to 127.0.0.1) keeps RemoteAddr on loopback
+//     yet carries its own domain in Host; rejecting that closes the rebinding
+//     path that would otherwise let a browser read the pairing code and pair a
+//     rogue device.
 func localOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := r.RemoteAddr
-		for j := len(host) - 1; j >= 0; j-- {
-			if host[j] == ':' {
-				host = host[:j]
-				break
-			}
-		}
-		if host != "127.0.0.1" && host != "::1" && host != "[::1]" {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil || !net.ParseIP(host).IsLoopback() {
 			http.Error(w, "dashboard is local-only", http.StatusForbidden)
+			return
+		}
+		if !loopbackHost(r.Host) {
+			http.Error(w, "dashboard is local-only (unexpected Host header)", http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// loopbackHost reports whether a Host header (or Origin host[:port]) refers to
+// the local machine.
+func loopbackHost(h string) bool {
+	host := h
+	if hh, _, err := net.SplitHostPort(h); err == nil {
+		host = hh
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // currentCode returns the active pairing code, minting a fresh one when forced,
@@ -331,7 +351,13 @@ func (s *Server) handleTermWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no terminal", http.StatusNotFound)
 		return
 	}
-	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	// Only accept WebSocket upgrades whose Origin is the loopback dashboard
+	// itself — a cross-origin page (e.g. a malicious site the user is visiting)
+	// must not be able to open this admin terminal bridge. A missing Origin
+	// (native clients) is allowed by coder/websocket.
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		OriginPatterns: []string{"127.0.0.1:*", "localhost:*", "[::1]:*", "::1"},
+	})
 	if err != nil {
 		return
 	}

@@ -1,14 +1,14 @@
 #!/bin/sh
 # Install the latest `outpost` release for this machine's OS/arch.
 #
-#   curl -fsSL https://raw.githubusercontent.com/famgia/remote-host/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/godx-jp/godx-outpost/main/scripts/install.sh | sh
 #
 # Installs to /usr/local/bin (via sudo if needed) or ~/.local/bin. Override with
 # OUTPOST_BIN_DIR=/path. Pure-Go static binary — no runtime dependencies (dtach
 # is optional, for restart-persistent sessions).
 set -eu
 
-REPO="famgia/remote-host"
+REPO="godx-jp/godx-outpost"
 BIN="outpost"
 
 os=$(uname -s)
@@ -39,6 +39,24 @@ echo "Downloading $asset ($tag)…"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 curl -fsSL "$url" -o "$tmp/$asset" || { echo "download failed: $url" >&2; exit 1; }
+
+# Verify the download against the release checksums (defends against a tampered
+# asset / broken TLS). Abort if the checksum is missing or doesn't match.
+curl -fsSL "https://github.com/$REPO/releases/download/$tag/checksums.txt" -o "$tmp/checksums.txt" \
+  || { echo "could not fetch checksums.txt — aborting" >&2; exit 1; }
+if command -v sha256sum >/dev/null 2>&1; then
+  got=$(sha256sum "$tmp/$asset" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  got=$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')
+else
+  echo "no sha256 tool (sha256sum/shasum) — cannot verify download; aborting" >&2; exit 1
+fi
+want=$(grep " $asset\$" "$tmp/checksums.txt" | awk '{print $1}' | head -1)
+if [ -z "$want" ] || [ "$got" != "$want" ]; then
+  echo "checksum mismatch for $asset (got $got, want ${want:-none}) — aborting" >&2
+  exit 1
+fi
+echo "checksum OK"
 tar -xzf "$tmp/$asset" -C "$tmp"
 
 # Pick an install dir.

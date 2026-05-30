@@ -33,6 +33,14 @@ func ListZellij() []ZellijSession {
 			return nil // no server, or no sessions
 		}
 	}
+	return parseZellijSessions(out)
+}
+
+// parseZellijSessions parses the output of `zellij list-sessions`, tolerating
+// both the plain (`-s`) and the ANSI-coloured formatted forms. Exited sessions
+// and the "no active sessions" notice are skipped. Separated from the exec call
+// so parsing can be unit-tested without a running zellij server.
+func parseZellijSessions(out []byte) []ZellijSession {
 	var res []ZellijSession
 	for _, raw := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		line := strings.TrimSpace(ansiRe.ReplaceAllString(raw, ""))

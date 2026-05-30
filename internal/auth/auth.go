@@ -36,8 +36,8 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/famgia/remote-host/internal/launcher"
-	"github.com/famgia/remote-host/internal/store"
+	"github.com/godx-jp/godx-outpost/internal/launcher"
+	"github.com/godx-jp/godx-outpost/internal/store"
 )
 
 // Token lifetimes. Access tokens are deliberately short so a leaked access
@@ -102,6 +102,17 @@ type Manager struct {
 // SetRevokeHook registers a callback invoked after RevokeDevice succeeds (e.g.
 // to kick the device's live WebSocket connections).
 func (m *Manager) SetRevokeHook(fn func(clientID string)) { m.revokeHook = fn }
+
+// DeviceActive reports whether a paired device is still active (not revoked).
+// Used to re-check a connection right after it registers, closing the race
+// where a device is revoked between token verification and registration.
+func (m *Manager) DeviceActive(clientID string) bool {
+	if clientID == "" {
+		return true // legacy tokens without a client id aren't per-device tracked
+	}
+	active, err := m.store.DeviceActive(clientID)
+	return err == nil && active
+}
 
 // ClientIDFromAccess returns the client id embedded in an access token, or ""
 // if absent/unparseable. Used to tie a live connection to a device so it can be
@@ -247,6 +258,11 @@ func loadOrCreateIdentity(dir string) (identity, error) {
 		}
 		if id.DeviceID == "" || id.SigningKey == "" {
 			return identity{}, fmt.Errorf("auth: %s is missing fields", identityFile)
+		}
+		// The signing key is the master secret (forges any token). Tighten the
+		// mode on load in case the file was created/restored with looser perms.
+		if fi, serr := os.Stat(path); serr == nil && fi.Mode().Perm()&0o077 != 0 {
+			_ = os.Chmod(path, 0o600)
 		}
 		return id, nil
 	} else if !errors.Is(err, os.ErrNotExist) {

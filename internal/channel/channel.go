@@ -12,8 +12,8 @@ package channel
 import (
 	"context"
 
-	"github.com/famgia/remote-host/internal/launcher"
-	"github.com/famgia/remote-host/internal/protocol"
+	"github.com/godx-jp/godx-outpost/internal/launcher"
+	"github.com/godx-jp/godx-outpost/internal/protocol"
 )
 
 // Conn is the server-side view of a single authenticated client connection,

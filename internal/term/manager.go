@@ -30,8 +30,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/famgia/remote-host/internal/launcher"
-	"github.com/famgia/remote-host/internal/store"
+	"github.com/godx-jp/godx-outpost/internal/launcher"
+	"github.com/godx-jp/godx-outpost/internal/store"
 )
 
 const maxScrollback = 256 * 1024 // 256 KiB scrollback retained per session

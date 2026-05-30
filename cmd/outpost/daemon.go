@@ -13,7 +13,7 @@ import (
 )
 
 // serviceLabel is the launchd/systemd service identifier.
-const serviceLabel = "com.famgia.outpost"
+const serviceLabel = "jp.godx.outpost"
 
 // installCmd registers outpost as a per-user service that starts at login (and so
 // comes back after a reboot). launchd on macOS, systemd --user on Linux.
