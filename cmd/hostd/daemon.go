@@ -20,6 +20,7 @@ const serviceLabel = "com.famgia.hostd"
 func installCmd() *cobra.Command {
 	var bind, port string
 	var pairTTL time.Duration
+	var restore bool
 	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install hostd as a login service (launchd on macOS, systemd --user on Linux)",
@@ -36,6 +37,9 @@ token is revoked).`,
 			exe, _ = filepath.Abs(exe)
 
 			runArgs := []string{"start", "--bind", bind, "--port", port, "--pair-ttl", pairTTL.String()}
+			if restore {
+				runArgs = append(runArgs, "--restore") // auto re-open saved sessions after a reboot
+			}
 			if flagConfigDir != "" {
 				runArgs = append(runArgs, "--config-dir", flagConfigDir)
 			}
@@ -53,6 +57,7 @@ token is revoked).`,
 	cmd.Flags().StringVar(&bind, "bind", "127.0.0.1", "bind address the service listens on")
 	cmd.Flags().StringVar(&port, "port", "8722", "listen port")
 	cmd.Flags().DurationVar(&pairTTL, "pair-ttl", 2*time.Minute, "pairing code lifetime")
+	cmd.Flags().BoolVar(&restore, "restore", true, "auto re-open saved sessions on each startup (after a reboot); --restore=false to disable")
 	return cmd
 }
 

@@ -128,6 +128,7 @@ func startCmd() *cobra.Command {
 	var bind string
 	var port string
 	var pairTTL time.Duration
+	var doRestore bool
 
 	cmd := &cobra.Command{
 		Use:   "start",
@@ -166,6 +167,15 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 			}
 			sessions := term.NewManager(launcher.NewDirect(), sessDir, useDtach, mgr.Store())
 
+			// Auto-restore saved sessions on startup (e.g. after a reboot). Only
+			// re-opens sessions whose dtach master is gone, so it's a no-op on a
+			// plain daemon relaunch.
+			if doRestore && useDtach {
+				if restored, rerr := term.RestoreFromStore(sessDir, os.Getenv("SHELL"), mgr.Store()); rerr == nil && len(restored) > 0 {
+					fmt.Printf("Restored        : %d saved session(s)\n", len(restored))
+				}
+			}
+
 			// Build the WebSocket server. The handler factory runs fresh per
 			// connection; only the terminal Manager is shared.
 			srv := server.New(mgr, makeHandlersFunc(sessions))
@@ -195,6 +205,7 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 	cmd.Flags().StringVar(&bind, "bind", "127.0.0.1", "bind address")
 	cmd.Flags().StringVar(&port, "port", "8722", "listen port")
 	cmd.Flags().DurationVar(&pairTTL, "pair-ttl", 2*time.Minute, "how long the pairing code stays valid (e.g. 30m for slow/manual pairing)")
+	cmd.Flags().BoolVar(&doRestore, "restore", false, "on startup, re-open saved sessions whose dtach master is gone (e.g. after a reboot)")
 	return cmd
 }
 
