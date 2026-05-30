@@ -25,10 +25,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/famgia/remote-host/internal/launcher"
+	"github.com/famgia/remote-host/internal/store"
 )
 
 const maxScrollback = 256 * 1024 // 256 KiB scrollback retained per session
@@ -167,9 +170,15 @@ func (s *Session) pump() {
 
 	s.mgr.dropFromMemory(s.id)
 	if exited {
+		// The shell exited while hostd was alive (intentional close) → forget it,
+		// including its durable record so `hostd restore` won't resurrect it.
+		// (A reboot/kill never runs this path, so those rows survive for restore.)
 		if s.socket != "" {
 			_ = os.Remove(s.socket)
 			_ = os.Remove(s.mgr.metaPath(s.id))
+		}
+		if s.mgr.store != nil {
+			s.mgr.store.DeleteSession(s.id)
 		}
 		for _, sub := range subs {
 			sub.Exit()
@@ -183,6 +192,7 @@ type Manager struct {
 	launcher launcher.Launcher
 	sessDir  string
 	useDtach bool
+	store    *store.Store // durable session metadata (cwd) for `hostd restore`
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -191,11 +201,12 @@ type Manager struct {
 
 // NewManager returns a Manager. If useDtach, sessions are backed by dtach using
 // sockets under sessDir (created if missing); otherwise sessions are in-process.
-func NewManager(l launcher.Launcher, sessDir string, useDtach bool) *Manager {
+// st (may be nil) persists session metadata + cwd for restore-after-reboot.
+func NewManager(l launcher.Launcher, sessDir string, useDtach bool, st *store.Store) *Manager {
 	if useDtach && sessDir != "" {
 		_ = os.MkdirAll(sessDir, 0o700)
 	}
-	return &Manager{launcher: l, sessDir: sessDir, useDtach: useDtach, sessions: make(map[string]*Session)}
+	return &Manager{launcher: l, sessDir: sessDir, useDtach: useDtach, store: st, sessions: make(map[string]*Session)}
 }
 
 func (m *Manager) sockPath(id string) string { return filepath.Join(m.sessDir, id+".sock") }
@@ -269,8 +280,21 @@ func (m *Manager) Create(p launcher.Profile, cols, rows uint16, title string) (*
 		return nil, fmt.Errorf("term: start session: %w", err)
 	}
 
-	s := m.newSession(id, title, time.Now().Unix(), pty, cols, rows, sock)
+	created := time.Now().Unix()
+	s := m.newSession(id, title, created, pty, cols, rows, sock)
 	m.register(s)
+	if m.store != nil {
+		cwd := p.Cwd
+		if cwd == "" {
+			if h, herr := os.UserHomeDir(); herr == nil {
+				cwd = h
+			}
+		}
+		_ = m.store.UpsertSession(store.SessionRow{
+			ID: id, Title: title, Cwd: cwd, Shell: shellFor(p),
+			Cols: int(cols), Rows: int(rows), Created: created, LastSeen: created,
+		})
+	}
 	go s.pump()
 	return s, nil
 }
@@ -339,10 +363,19 @@ func (m *Manager) List() []SessionInfo {
 			meta := m.readMeta(id)
 			alive := socketAlive(m.sockPath(id))
 			if !alive {
-				// Stale session — its master is gone; clean it up.
+				// Stale socket — its master is gone (e.g. reboot). Clean the
+				// socket/meta files; the durable store row is kept so
+				// `hostd restore` can re-open it.
 				_ = os.Remove(m.sockPath(id))
 				_ = os.Remove(m.metaPath(id))
 				continue
+			}
+			// Snapshot the shell's current working directory so a later restore
+			// re-opens the session in the right folder.
+			if m.store != nil {
+				if cwd := sessionShellCwd(m.sockPath(id)); cwd != "" {
+					m.store.SetSessionCwd(id, cwd)
+				}
 			}
 			byID[id] = SessionInfo{ID: id, Title: meta.Title, Cols: meta.Cols, Rows: meta.Rows, Alive: true, Created: meta.Created}
 		}
@@ -380,6 +413,9 @@ func (m *Manager) Kill(id string) error {
 		_ = exec.Command("pkill", "-f", sock).Run()
 		_ = os.Remove(sock)
 		_ = os.Remove(m.metaPath(id))
+	}
+	if m.store != nil {
+		m.store.DeleteSession(id)
 	}
 	if ok {
 		_ = s.pty.Close()
@@ -426,4 +462,121 @@ func randID() string {
 		return fmt.Sprintf("t-%d", time.Now().UnixNano())
 	}
 	return "t-" + hex.EncodeToString(b)
+}
+
+// ---- cwd tracking + restore -------------------------------------------------
+
+// sessionShellCwd best-effort resolves the working directory of the shell
+// running inside the dtach master for sock. The process tree is
+// dtach(client) → dtach(master) → shell, so we descend from the dtach pids
+// (which carry the socket in argv) past any further dtach processes and return
+// the cwd of the first non-dtach descendant (the shell).
+func sessionShellCwd(sock string) string {
+	seen := map[string]bool{}
+	queue := pgrep("-f", sock)
+	for len(queue) > 0 {
+		pid := queue[0]
+		queue = queue[1:]
+		if seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		if comm := procComm(pid); comm != "" && !strings.Contains(comm, "dtach") {
+			if cwd := procCwd(pid); cwd != "" {
+				return cwd
+			}
+		}
+		queue = append(queue, pgrep("-P", pid)...)
+	}
+	return ""
+}
+
+// procComm returns a process's executable name (best-effort).
+func procComm(pid string) string {
+	out, err := exec.Command("ps", "-o", "comm=", "-p", pid).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func pgrep(flag, arg string) []string {
+	out, err := exec.Command("pgrep", flag, arg).Output()
+	if err != nil {
+		return nil
+	}
+	var pids []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			pids = append(pids, line)
+		}
+	}
+	return pids
+}
+
+// procCwd returns a process's current working directory (best-effort).
+func procCwd(pid string) string {
+	if runtime.GOOS == "linux" {
+		if p, err := os.Readlink("/proc/" + pid + "/cwd"); err == nil {
+			return p
+		}
+		return ""
+	}
+	// macOS/BSD: lsof -a -d cwd -p <pid> -Fn prints a line "n<path>".
+	out, err := exec.Command("lsof", "-a", "-d", "cwd", "-p", pid, "-Fn").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "n") {
+			return strings.TrimPrefix(line, "n")
+		}
+	}
+	return ""
+}
+
+// RestoreFromStore re-opens persisted sessions whose dtach master is no longer
+// running (e.g. after a reboot): for each it spawns a fresh dtach master running
+// the shell in the session's saved working directory, and writes the socket-meta
+// file so a running daemon lists it. Returns the rows it restored.
+func RestoreFromStore(sessDir, shell string, st *store.Store) ([]store.SessionRow, error) {
+	if shell == "" {
+		shell = shellFor(launcher.Profile{})
+	}
+	if err := os.MkdirAll(sessDir, 0o700); err != nil {
+		return nil, err
+	}
+	rows, err := st.ListSessions()
+	if err != nil {
+		return nil, err
+	}
+	var restored []store.SessionRow
+	for _, r := range rows {
+		sock := filepath.Join(sessDir, r.ID+".sock")
+		if socketAlive(sock) {
+			continue // already running
+		}
+		cwd := r.Cwd
+		if cwd == "" {
+			if h, herr := os.UserHomeDir(); herr == nil {
+				cwd = h
+			}
+		}
+		// dtach -n: create a detached master (no client) running the shell.
+		cmd := exec.Command("dtach", "-n", sock, "-z", shell)
+		cmd.Dir = cwd
+		cmd.Env = os.Environ()
+		if err := cmd.Start(); err != nil {
+			continue
+		}
+		_ = cmd.Wait() // returns once the daemon has forked off
+
+		meta := sessionMeta{ID: r.ID, Title: r.Title, Created: r.Created, Cols: uint16(r.Cols), Rows: uint16(r.Rows)}
+		if data, merr := json.Marshal(meta); merr == nil {
+			_ = os.WriteFile(filepath.Join(sessDir, r.ID+".json"), data, 0o600)
+		}
+		st.SetArchived(r.ID, false)
+		restored = append(restored, r)
+	}
+	return restored, nil
 }

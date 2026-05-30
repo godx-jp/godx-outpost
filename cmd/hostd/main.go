@@ -73,7 +73,7 @@ terminal, file browser, system monitor, and custom API over WebSocket.`,
 
 	root.PersistentFlags().StringVar(&flagConfigDir, "config-dir", "",
 		"identity/token directory (default ~/.config/hostd or platform equivalent); use distinct dirs to run multiple independent hosts")
-	root.AddCommand(startCmd(), pairCmd(), statusCmd(), revokeCmd(), devicesCmd(), versionCmd(), installCmd(), uninstallCmd())
+	root.AddCommand(startCmd(), pairCmd(), statusCmd(), revokeCmd(), devicesCmd(), restoreCmd(), versionCmd(), installCmd(), uninstallCmd())
 	return root
 }
 
@@ -164,7 +164,7 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 			} else {
 				fmt.Println("Sessions        : in-process (install dtach for restart-persistent + local attach)")
 			}
-			sessions := term.NewManager(launcher.NewDirect(), sessDir, useDtach)
+			sessions := term.NewManager(launcher.NewDirect(), sessDir, useDtach, mgr.Store())
 
 			// Build the WebSocket server. The handler factory runs fresh per
 			// connection; only the terminal Manager is shared.
@@ -319,6 +319,51 @@ func devicesCmd() *cobra.Command {
 					time.Unix(d.PairedAt, 0).Format("2006-01-02 15:04"),
 					time.Unix(d.LastSeen, 0).Format("2006-01-02 15:04"),
 					status)
+			}
+			return nil
+		},
+	}
+}
+
+// ---- restore -----------------------------------------------------------------
+
+func restoreCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "restore",
+		Short: "Re-open saved terminal sessions (e.g. after a reboot) in their folders",
+		Long: `Re-create persisted terminal sessions whose dtach master is gone (after a
+reboot) — each as a fresh shell in the working directory it was last seen in.
+
+A reboot ends the original running processes; this restores the session list and
+working directories, not live programs. Run it once after boot (the daemon then
+lists the restored sessions and the app can attach to them).`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if _, lerr := exec.LookPath("dtach"); lerr != nil {
+				return fmt.Errorf("restore requires dtach (brew install dtach)")
+			}
+			mgr, err := auth.LoadFrom(flagConfigDir)
+			if err != nil {
+				return fmt.Errorf("load identity: %w", err)
+			}
+			defer mgr.Close()
+
+			cfgDir := flagConfigDir
+			if cfgDir == "" {
+				cfgDir, _ = auth.DefaultConfigDir()
+			}
+			sessDir := filepath.Join(cfgDir, "sessions")
+
+			restored, err := term.RestoreFromStore(sessDir, os.Getenv("SHELL"), mgr.Store())
+			if err != nil {
+				return fmt.Errorf("restore: %w", err)
+			}
+			if len(restored) == 0 {
+				fmt.Println("No sessions to restore (none saved, or all already running).")
+				return nil
+			}
+			fmt.Printf("Restored %d session(s):\n", len(restored))
+			for _, r := range restored {
+				fmt.Printf("  %-12s  %-12s  %s\n", r.ID, r.Title, r.Cwd)
 			}
 			return nil
 		},
