@@ -261,6 +261,8 @@ func buildDashboard(mgr *auth.Manager, sessions *term.Manager, wsURL string, pai
 				}
 				out = append(out, dashboard.DeviceInfo{
 					ClientID: d.ClientID,
+					Name:     d.Name,
+					Type:     d.Type,
 					PairedAt: time.Unix(d.PairedAt, 0).Format("2006-01-02 15:04"),
 					LastSeen: time.Unix(d.LastSeen, 0).Format("2006-01-02 15:04"),
 					Status:   status,
@@ -268,6 +270,8 @@ func buildDashboard(mgr *auth.Manager, sessions *term.Manager, wsURL string, pai
 			}
 			return out, nil
 		},
+		Revoke: mgr.RevokeDevice,
+		Rename: mgr.RenameDevice,
 		Sessions: func() []dashboard.SessionInfo {
 			cwd := map[string]string{}
 			if rows, err := mgr.Store().ListSessions(); err == nil {
@@ -409,15 +413,18 @@ func devicesCmd() *cobra.Command {
 				fmt.Println("No paired devices yet.")
 				return nil
 			}
-			fmt.Printf("%-18s  %-20s  %-20s  %s\n", "CLIENT ID", "PAIRED", "LAST SEEN", "STATUS")
+			fmt.Printf("%-18s  %-20s  %-22s  %-16s  %s\n", "CLIENT ID", "NAME", "TYPE", "LAST SEEN", "STATUS")
 			for _, d := range devices {
 				status := "active"
 				if d.Revoked {
 					status = "revoked"
 				}
-				fmt.Printf("%-18s  %-20s  %-20s  %s\n",
-					d.ClientID,
-					time.Unix(d.PairedAt, 0).Format("2006-01-02 15:04"),
+				name := d.Name
+				if name == "" {
+					name = "(unnamed)"
+				}
+				fmt.Printf("%-18s  %-20s  %-22s  %-16s  %s\n",
+					d.ClientID, name, d.Type,
 					time.Unix(d.LastSeen, 0).Format("2006-01-02 15:04"),
 					status)
 			}

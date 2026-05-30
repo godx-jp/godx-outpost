@@ -203,6 +203,11 @@ func (m *Manager) Devices() ([]store.Device, error) { return m.store.ListDevices
 // RevokeDevice revokes a single paired client by id; its tokens stop working.
 func (m *Manager) RevokeDevice(clientID string) error { return m.store.RevokeDevice(clientID) }
 
+// RenameDevice sets a device's display name.
+func (m *Manager) RenameDevice(clientID, name string) error {
+	return m.store.RenameDevice(clientID, name)
+}
+
 // loadOrCreateIdentity reads identity.json if present (idempotent: existing
 // secrets are returned untouched), otherwise generates and persists fresh ones.
 func loadOrCreateIdentity(dir string) (identity, error) {
@@ -305,7 +310,7 @@ var ErrInvalidCode = errors.New("auth: invalid or expired pairing code")
 
 // RedeemPairing validates an unexpired pairing code, consumes it, and issues a
 // fresh access/refresh token pair. The code cannot be redeemed twice.
-func (m *Manager) RedeemPairing(code string) (TokenPair, error) {
+func (m *Manager) RedeemPairing(code, name, devType string) (TokenPair, error) {
 	m.mu.Lock()
 	m.pruneExpiredLocked()
 
@@ -338,7 +343,7 @@ func (m *Manager) RedeemPairing(code string) (TokenPair, error) {
 	// Register this newly paired client so it can be listed and revoked
 	// individually (see `hostd devices` / RevokeDevice).
 	clientID := randomHex(8)
-	if err := m.store.AddDevice(clientID, ""); err != nil {
+	if err := m.store.AddDevice(clientID, name, devType); err != nil {
 		return TokenPair{}, fmt.Errorf("auth: record device: %w", err)
 	}
 

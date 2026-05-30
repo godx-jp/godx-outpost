@@ -22,6 +22,8 @@ import (
 // the auth/term packages — cmd supplies them via the closures below).
 type DeviceInfo struct {
 	ClientID string
+	Name     string
+	Type     string
 	PairedAt string
 	LastSeen string
 	Status   string
@@ -42,16 +44,26 @@ type Server struct {
 	NewCode      func() string                // mint a fresh pairing code
 	Devices      func() ([]DeviceInfo, error) // paired clients
 	Sessions     func() []SessionInfo         // live terminal sessions
+	Revoke       func(clientID string) error  // kick a device
+	Rename       func(clientID, name string) error
 
-	mu   sync.Mutex
-	code string // current pairing code shown in the QR
+	mu     sync.Mutex
+	code   string    // current pairing code shown in the QR
+	codeAt time.Time // when it was minted (for auto-rotation)
 }
+
+// rotateEvery is how long a dashboard pairing code stays shown before a fresh
+// one is minted automatically (the page polls and updates the QR).
+const rotateEvery = time.Minute
 
 // ListenAndServe runs the dashboard on 127.0.0.1:port until ctx is cancelled.
 func (s *Server) ListenAndServe(ctx context.Context, port string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/qr.png", s.handleQR)
+	mux.HandleFunc("/api/code", s.handleCode)
+	mux.HandleFunc("/api/revoke", s.handleRevoke)
+	mux.HandleFunc("/api/rename", s.handleRename)
 
 	srv := &http.Server{Addr: "127.0.0.1:" + port, Handler: localOnly(mux)}
 	go func() {
@@ -86,15 +98,45 @@ func localOnly(next http.Handler) http.Handler {
 	})
 }
 
-// currentCode returns the active pairing code, minting one if needed or when
-// forced (the "new code" button).
+// currentCode returns the active pairing code, minting a fresh one when forced,
+// on first use, or once the current one is older than rotateEvery.
 func (s *Server) currentCode(force bool) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if force || s.code == "" {
+	if force || s.code == "" || time.Since(s.codeAt) >= rotateEvery {
 		s.code = s.NewCode()
+		s.codeAt = time.Now()
 	}
 	return s.code
+}
+
+// handleCode returns the current pairing code as JSON (the page polls this and
+// reloads the QR when the code changes). ?new=1 forces a fresh code.
+func (s *Server) handleCode(w http.ResponseWriter, r *http.Request) {
+	code := s.currentCode(r.URL.Query().Get("new") != "")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"code": code, "url": s.AdvertiseURL, "deviceID": s.DeviceID,
+	})
+}
+
+// handleRevoke kicks a device: /api/revoke?id=<clientId>.
+func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id != "" && s.Revoke != nil {
+		_ = s.Revoke(id)
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// handleRename sets a device's name: /api/rename?id=<clientId>&name=<name>.
+func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	name := r.URL.Query().Get("name")
+	if id != "" && s.Rename != nil {
+		_ = s.Rename(id, name)
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -143,20 +185,40 @@ var indexTmpl = template.Must(template.New("dash").Parse(`<!DOCTYPE html>
    padding:8px 16px;border-radius:8px;text-decoration:none;font-weight:600}
  table{width:100%;border-collapse:collapse;font-size:13px} td,th{text-align:left;padding:6px 8px;border-bottom:1px solid #1c1c1c}
  th{color:#777;font-weight:500} .ok{color:#4caf50} .off{color:#ef5350} .mono{font-family:monospace}
- .empty{color:#555;padding:8px}
+ .empty{color:#555;padding:8px} .kick{color:#ef5350;text-decoration:none;font-size:12px}
+ .link{color:#4fc3f7;text-decoration:none;font-size:12px}
+ #newbtn{border:none;cursor:pointer}
 </style></head><body>
  <h1>hostd dashboard</h1>
  <div class="sub">device {{.DeviceID}} · {{.URL}}</div>
 
  <div class="card"><div class="qr">
-   <img src="/qr.png?t={{.Now}}" alt="pairing QR">
+   <img id="qr" src="/qr.png?t={{.Now}}" alt="pairing QR">
    <div>
-     <div class="muted">Scan in the app (Hosts → Scan QR), or enter manually:</div>
+     <div class="muted">Scan in the app (Hosts → Scan QR) — the QR contains the URL + code:</div>
      <div style="margin:8px 0"><span class="mono muted">{{.URL}}</span></div>
-     <div class="code">{{.Code}}</div>
-     <a class="btn" href="/?new=1">New code</a>
+     <div class="code" id="code">{{.Code}}</div>
+     <div class="muted" id="rotate" style="margin-bottom:6px"></div>
+     <button class="btn" id="newbtn">Refresh code</button>
    </div>
  </div></div>
+ <script>
+   var lastCode = {{.Code}} + '';
+   var nextAt = Date.now() + 60000;
+   function paint(code){
+     if(code !== lastCode){ lastCode = code; document.getElementById('code').textContent = code;
+       document.getElementById('qr').src = '/qr.png?t=' + Date.now(); nextAt = Date.now() + 60000; }
+   }
+   async function poll(force){
+     try{ var r = await fetch('/api/code' + (force?'?new=1':'')); var j = await r.json(); paint(j.code); }catch(e){}
+   }
+   document.getElementById('newbtn').onclick = function(){ nextAt = Date.now()+60000; poll(true); };
+   setInterval(function(){ poll(false); }, 5000);              // pick up the 60s auto-rotation
+   setInterval(function(){                                      // countdown label
+     var s = Math.max(0, Math.round((nextAt - Date.now())/1000));
+     document.getElementById('rotate').textContent = 'auto-refreshes in ' + s + 's';
+   }, 1000);
+ </script>
 
  <div class="card">
    <h1 style="font-size:15px">Sessions ({{len .Sessions}})</h1>
@@ -169,11 +231,22 @@ var indexTmpl = template.Must(template.New("dash").Parse(`<!DOCTYPE html>
 
  <div class="card">
    <h1 style="font-size:15px">Paired devices ({{len .Devices}})</h1>
-   <table><tr><th>client id</th><th>paired</th><th>last seen</th><th>status</th></tr>
-   {{range .Devices}}<tr><td class="mono">{{.ClientID}}</td><td class="muted">{{.PairedAt}}</td>
-     <td class="muted">{{.LastSeen}}</td><td>{{if eq .Status "active"}}<span class="ok">active</span>{{else}}<span class="off">revoked</span>{{end}}</td></tr>
-   {{else}}<tr><td colspan="4" class="empty">No paired devices yet.</td></tr>{{end}}
+   <table><tr><th>name</th><th>type</th><th>last seen</th><th>status</th><th></th></tr>
+   {{range .Devices}}<tr>
+     <td>{{if .Name}}{{.Name}}{{else}}<span class="muted">(unnamed)</span>{{end}}
+       <a class="link" href="#" onclick="renameDev('{{.ClientID}}','{{.Name}}');return false">✎</a></td>
+     <td class="muted">{{if .Type}}{{.Type}}{{else}}—{{end}}</td>
+     <td class="muted">{{.LastSeen}}</td>
+     <td>{{if eq .Status "active"}}<span class="ok">active</span>{{else}}<span class="off">revoked</span>{{end}}</td>
+     <td>{{if eq .Status "active"}}<a class="kick" href="/api/revoke?id={{.ClientID}}" onclick="return confirm('Kick this device? It must re-pair.')">Kick</a>{{end}}</td>
+   </tr>{{else}}<tr><td colspan="5" class="empty">No paired devices yet.</td></tr>{{end}}
    </table>
  </div>
+ <script>
+   function renameDev(id, cur){
+     var n = prompt('Device name:', cur || '');
+     if(n !== null) location.href = '/api/rename?id=' + encodeURIComponent(id) + '&name=' + encodeURIComponent(n);
+   }
+ </script>
  <div class="muted">Refresh the page to update. Dashboard is local-only (127.0.0.1).</div>
 </body></html>`))

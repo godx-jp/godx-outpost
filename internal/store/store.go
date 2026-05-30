@@ -45,6 +45,7 @@ func (s *Store) migrate() error {
 CREATE TABLE IF NOT EXISTS devices (
   client_id TEXT PRIMARY KEY,
   name      TEXT NOT NULL DEFAULT '',
+  type      TEXT NOT NULL DEFAULT '',
   paired_at INTEGER NOT NULL,
   last_seen INTEGER NOT NULL,
   revoked   INTEGER NOT NULL DEFAULT 0
@@ -63,6 +64,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
 	}
+	// Add columns introduced after the first release (ignore "duplicate column").
+	_, _ = s.db.Exec(`ALTER TABLE devices ADD COLUMN type TEXT NOT NULL DEFAULT ''`)
 	return nil
 }
 
@@ -72,19 +75,32 @@ CREATE TABLE IF NOT EXISTS sessions (
 type Device struct {
 	ClientID string `json:"clientId"`
 	Name     string `json:"name"`
+	Type     string `json:"type"`
 	PairedAt int64  `json:"pairedAt"`
 	LastSeen int64  `json:"lastSeen"`
 	Revoked  bool   `json:"revoked"`
 }
 
-// AddDevice records a freshly paired client.
-func (s *Store) AddDevice(clientID, name string) error {
+// AddDevice records a freshly paired client (name/type supplied by the client).
+func (s *Store) AddDevice(clientID, name, devType string) error {
 	now := time.Now().Unix()
 	_, err := s.db.Exec(
-		`INSERT INTO devices(client_id,name,paired_at,last_seen,revoked) VALUES(?,?,?,?,0)
-		 ON CONFLICT(client_id) DO UPDATE SET name=excluded.name, last_seen=excluded.last_seen, revoked=0`,
-		clientID, name, now, now)
+		`INSERT INTO devices(client_id,name,type,paired_at,last_seen,revoked) VALUES(?,?,?,?,?,0)
+		 ON CONFLICT(client_id) DO UPDATE SET name=excluded.name, type=excluded.type, last_seen=excluded.last_seen, revoked=0`,
+		clientID, name, devType, now, now)
 	return err
+}
+
+// RenameDevice updates a device's display name.
+func (s *Store) RenameDevice(clientID, name string) error {
+	res, err := s.db.Exec(`UPDATE devices SET name=? WHERE client_id=?`, name, clientID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("store: no such device %q", clientID)
+	}
+	return nil
 }
 
 // DeviceActive reports whether a client exists and is not revoked.
@@ -119,7 +135,7 @@ func (s *Store) RevokeDevice(clientID string) error {
 
 // ListDevices returns all known devices, newest pairing first.
 func (s *Store) ListDevices() ([]Device, error) {
-	rows, err := s.db.Query(`SELECT client_id,name,paired_at,last_seen,revoked FROM devices ORDER BY paired_at DESC`)
+	rows, err := s.db.Query(`SELECT client_id,name,type,paired_at,last_seen,revoked FROM devices ORDER BY paired_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +144,7 @@ func (s *Store) ListDevices() ([]Device, error) {
 	for rows.Next() {
 		var d Device
 		var rev int
-		if err := rows.Scan(&d.ClientID, &d.Name, &d.PairedAt, &d.LastSeen, &rev); err != nil {
+		if err := rows.Scan(&d.ClientID, &d.Name, &d.Type, &d.PairedAt, &d.LastSeen, &rev); err != nil {
 			return nil, err
 		}
 		d.Revoked = rev != 0

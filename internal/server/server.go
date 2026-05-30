@@ -180,7 +180,9 @@ func (s *Server) handleBinary(ctx context.Context, c *conn, byChannel map[protoc
 // ctrl payload shapes.
 type (
 	pairReq struct {
-		Code string `json:"code"`
+		Code     string `json:"code"`
+		Name     string `json:"name"`     // device display name (e.g. "Satoshi's iPhone")
+		Platform string `json:"platform"` // device type (e.g. "iPhone 15 · iOS 18")
 	}
 	authReq struct {
 		Access string `json:"access"`
@@ -211,7 +213,7 @@ func (s *Server) handleCtrl(c *conn, env protocol.Envelope) {
 			s.ctrlErr(c, env.ID, "bad pair request")
 			return
 		}
-		pair, err := s.mgr.RedeemPairing(req.Code)
+		pair, err := s.mgr.RedeemPairing(req.Code, req.Name, req.Platform)
 		if err != nil {
 			s.ctrlErr(c, env.ID, err.Error())
 			return
