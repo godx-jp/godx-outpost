@@ -25,6 +25,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -33,6 +35,7 @@ import (
 	"github.com/famgia/remote-host/internal/auth"
 	"github.com/famgia/remote-host/internal/channel"
 	"github.com/famgia/remote-host/internal/customapi"
+	"github.com/famgia/remote-host/internal/dashboard"
 	fs "github.com/famgia/remote-host/internal/fs"
 	"github.com/famgia/remote-host/internal/launcher"
 	"github.com/famgia/remote-host/internal/qr"
@@ -130,6 +133,8 @@ func startCmd() *cobra.Command {
 	var pairTTL time.Duration
 	var doRestore bool
 	var advertise string
+	var doOpen bool
+	var dashPort string
 
 	cmd := &cobra.Command{
 		Use:   "start",
@@ -202,6 +207,23 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 				cancel()
 			}()
 
+			// Optional local web dashboard (always 127.0.0.1 — it hands out
+			// pairing QRs so it must never be exposed on the LAN).
+			if doOpen {
+				if dashPort == "" {
+					if p, perr := strconv.Atoi(port); perr == nil {
+						dashPort = strconv.Itoa(p + 1000) // 8722 → 9722, distinct per host
+					} else {
+						dashPort = "9720"
+					}
+				}
+				dash := buildDashboard(mgr, sessions, wsURL, pairTTL)
+				go func() { _ = dash.ListenAndServe(ctx, dashPort) }()
+				dashURL := "http://127.0.0.1:" + dashPort
+				fmt.Printf("Dashboard       : %s\n", dashURL)
+				go openBrowser(dashURL)
+			}
+
 			if err := srv.ListenAndServe(ctx, addr); err != nil {
 				return fmt.Errorf("serve: %w", err)
 			}
@@ -214,7 +236,67 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 	cmd.Flags().DurationVar(&pairTTL, "pair-ttl", 2*time.Minute, "how long the pairing code stays valid (e.g. 30m for slow/manual pairing)")
 	cmd.Flags().BoolVar(&doRestore, "restore", false, "on startup, re-open saved sessions whose dtach master is gone (e.g. after a reboot)")
 	cmd.Flags().StringVar(&advertise, "advertise", "", "URL to embed in the pairing QR (default ws://<bind>:<port>); set this to the LAN/relay URL clients use, e.g. ws://192.168.1.28:8722")
+	cmd.Flags().BoolVar(&doOpen, "open", false, "start a local web dashboard (QR + devices + sessions) and open it in the browser")
+	cmd.Flags().StringVar(&dashPort, "dashboard-port", "", "dashboard port on 127.0.0.1 (default: listen port + 1000)")
 	return cmd
+}
+
+// buildDashboard wires the dashboard's data closures to the auth + session
+// managers (kept here so the dashboard package stays decoupled).
+func buildDashboard(mgr *auth.Manager, sessions *term.Manager, wsURL string, pairTTL time.Duration) *dashboard.Server {
+	return &dashboard.Server{
+		DeviceID:     mgr.DeviceID(),
+		AdvertiseURL: wsURL,
+		NewCode:      func() string { return mgr.StartPairing(pairTTL) },
+		Devices: func() ([]dashboard.DeviceInfo, error) {
+			ds, err := mgr.Devices()
+			if err != nil {
+				return nil, err
+			}
+			out := make([]dashboard.DeviceInfo, 0, len(ds))
+			for _, d := range ds {
+				status := "active"
+				if d.Revoked {
+					status = "revoked"
+				}
+				out = append(out, dashboard.DeviceInfo{
+					ClientID: d.ClientID,
+					PairedAt: time.Unix(d.PairedAt, 0).Format("2006-01-02 15:04"),
+					LastSeen: time.Unix(d.LastSeen, 0).Format("2006-01-02 15:04"),
+					Status:   status,
+				})
+			}
+			return out, nil
+		},
+		Sessions: func() []dashboard.SessionInfo {
+			cwd := map[string]string{}
+			if rows, err := mgr.Store().ListSessions(); err == nil {
+				for _, r := range rows {
+					cwd[r.ID] = r.Cwd
+				}
+			}
+			var out []dashboard.SessionInfo
+			for _, s := range sessions.List() {
+				out = append(out, dashboard.SessionInfo{ID: s.ID, Title: s.Title, Cwd: cwd[s.ID], Alive: s.Alive})
+			}
+			return out
+		},
+	}
+}
+
+// openBrowser opens url in the default browser (best-effort, per OS).
+func openBrowser(url string) {
+	var cmd string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = "open"
+	case "windows":
+		cmd, args = "rundll32", []string{"url.dll,FileProtocolHandler"}
+	default:
+		cmd = "xdg-open"
+	}
+	_ = exec.Command(cmd, append(args, url)...).Start()
 }
 
 // ---- pair --------------------------------------------------------------------
