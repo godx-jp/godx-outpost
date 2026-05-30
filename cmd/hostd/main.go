@@ -129,6 +129,7 @@ func startCmd() *cobra.Command {
 	var port string
 	var pairTTL time.Duration
 	var doRestore bool
+	var advertise string
 
 	cmd := &cobra.Command{
 		Use:   "start",
@@ -144,7 +145,13 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 			defer mgr.Close()
 
 			addr := bind + ":" + port
+			// The URL embedded in the QR must be reachable by the client. When
+			// binding 0.0.0.0 (all interfaces) the bind address is useless to a
+			// phone, so let the user advertise the real LAN/relay URL.
 			wsURL := "ws://" + addr
+			if advertise != "" {
+				wsURL = advertise
+			}
 
 			// Shared terminal session manager: one per daemon. When dtach is
 			// available, sessions are backed by dtach sockets under the config
@@ -206,6 +213,7 @@ The mobile app scans the QR to pair and receives a long-lived token.`,
 	cmd.Flags().StringVar(&port, "port", "8722", "listen port")
 	cmd.Flags().DurationVar(&pairTTL, "pair-ttl", 2*time.Minute, "how long the pairing code stays valid (e.g. 30m for slow/manual pairing)")
 	cmd.Flags().BoolVar(&doRestore, "restore", false, "on startup, re-open saved sessions whose dtach master is gone (e.g. after a reboot)")
+	cmd.Flags().StringVar(&advertise, "advertise", "", "URL to embed in the pairing QR (default ws://<bind>:<port>); set this to the LAN/relay URL clients use, e.g. ws://192.168.1.28:8722")
 	return cmd
 }
 
