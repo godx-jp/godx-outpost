@@ -108,7 +108,17 @@ outpost restore    Re-open saved sessions (after a reboot).
 outpost install    Install as a login service (launchd / systemd --user).
 outpost uninstall  Remove the login service.
 outpost version
+
+# Local, tmux-style session access (on the host — no daemon/WebSocket needed):
+outpost ls                  List sessions (outpost/dtach + tmux + zellij).
+outpost attach <id|name>    Attach locally (dtach -a / tmux / zellij attach).
+outpost new [title]         Create a session and drop into it (dtach -A).
 ```
+
+The `ls`/`attach`/`new` commands operate directly on the dtach sockets, so a
+session you start on the host shows up in the app and vice-versa — like tmux
+shared between your terminal and your phone. Detach an outpost/dtach session
+with `Ctrl-\`. Pass the same `--config-dir` the daemon uses.
 
 **`start` / `install` flags**
 
