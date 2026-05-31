@@ -1,5 +1,8 @@
 # Outpost
 
+[![CI](https://github.com/godx-jp/godx-outpost/actions/workflows/ci.yml/badge.svg)](https://github.com/godx-jp/godx-outpost/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **Control your computer from your phone — terminal, files, and system monitor over a single secure WebSocket.** Think TeamViewer/Termius, but self-hosted: a small Go daemon (`outpost`) runs on the machine you want to reach, and a React Native app (iOS) pairs with it by scanning a QR code.
 
 - 🖥️ **Native terminal** on the phone (SwiftTerm) — real `UITextInput`, so IME input (incl. Vietnamese Telex), native scrolling, truecolor. Renders Claude Code / Codex / vim / tmux correctly.
