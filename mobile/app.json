@@ -15,7 +15,8 @@
       "supportsTablet": true,
       "bundleIdentifier": "jp.godx.outpost",
       "infoPlist": {
-        "NSCameraUsageDescription": "Camera is used to scan the pairing QR code displayed on the host."
+        "NSCameraUsageDescription": "Camera is used to scan the pairing QR code displayed on the host.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {

@@ -171,6 +171,8 @@ npx expo run:ios --device     # build + install on a connected iPhone (needs Xco
 
 The SwiftTerm dependency is added via Swift Package Manager to the iOS app target (see `mobile/ios/`); a full dev-client rebuild is required after native changes.
 
+**Releasing** (Homebrew tap + TestFlight): see **[docs/DEPLOY.md](docs/DEPLOY.md)**.
+
 ---
 
 ## Building from source
