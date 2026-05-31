@@ -20,6 +20,20 @@ export interface Host {
 const HOSTS_KEY  = 'rh_hosts';
 const ACTIVE_KEY = 'rh_active_host';
 
+// Single-flight write queue. Every mutation of the hosts registry does a
+// read-modify-write of the one `rh_hosts` blob; without serialization two
+// concurrent writers (e.g. a token refresh's updateHostTokens racing a
+// pair/remove) clobber each other — dropping a freshly added host or
+// resurrecting a just-removed one. Chaining all mutations through one promise
+// makes each read-modify-write atomic relative to the others.
+let writeChain: Promise<unknown> = Promise.resolve();
+function enqueue<T>(task: () => Promise<T>): Promise<T> {
+  const run = writeChain.then(task, task);
+  // Keep the chain alive regardless of individual task failures.
+  writeChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 export async function listHosts(): Promise<Host[]> {
   const raw = await storageGet(HOSTS_KEY);
   if (!raw) return [];
@@ -37,23 +51,34 @@ export async function getHost(id: string): Promise<Host | undefined> {
 
 /** Insert or update a host (keyed by id). */
 export async function saveHost(host: Host): Promise<void> {
-  const hosts = await listHosts();
-  const i = hosts.findIndex((h) => h.id === host.id);
-  if (i >= 0) hosts[i] = host;
-  else hosts.push(host);
-  await storageSet(HOSTS_KEY, JSON.stringify(hosts));
+  return enqueue(async () => {
+    const hosts = await listHosts();
+    const i = hosts.findIndex((h) => h.id === host.id);
+    if (i >= 0) hosts[i] = host;
+    else hosts.push(host);
+    await storageSet(HOSTS_KEY, JSON.stringify(hosts));
+  });
 }
 
 export async function removeHost(id: string): Promise<void> {
-  const hosts = (await listHosts()).filter((h) => h.id !== id);
-  await storageSet(HOSTS_KEY, JSON.stringify(hosts));
-  if ((await getActiveHostId()) === id) await setActiveHostId(null);
+  return enqueue(async () => {
+    const hosts = (await listHosts()).filter((h) => h.id !== id);
+    await storageSet(HOSTS_KEY, JSON.stringify(hosts));
+    // Inline the active-id clear (not via setActiveHostId) to avoid enqueuing
+    // inside an already-running queued task (which would deadlock).
+    if ((await getActiveHostId()) === id) await storageSet(ACTIVE_KEY, '');
+  });
 }
 
 /** Update just the tokens for a host (called when they refresh). */
 export async function updateHostTokens(id: string, access: string, refresh: string): Promise<void> {
-  const h = await getHost(id);
-  if (h) await saveHost({ ...h, access, refresh });
+  return enqueue(async () => {
+    const hosts = await listHosts();
+    const i = hosts.findIndex((h) => h.id === id);
+    if (i < 0) return; // host was removed → don't resurrect it
+    hosts[i] = { ...hosts[i], access, refresh };
+    await storageSet(HOSTS_KEY, JSON.stringify(hosts));
+  });
 }
 
 export async function getActiveHostId(): Promise<string | null> {
@@ -62,7 +87,7 @@ export async function getActiveHostId(): Promise<string | null> {
 }
 
 export async function setActiveHostId(id: string | null): Promise<void> {
-  await storageSet(ACTIVE_KEY, id ?? '');
+  return enqueue(async () => { await storageSet(ACTIVE_KEY, id ?? ''); });
 }
 
 /** A friendly default name derived from a ws URL (host:port). */

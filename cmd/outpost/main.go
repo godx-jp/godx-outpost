@@ -78,6 +78,8 @@ terminal, file browser, system monitor, and custom API over WebSocket.`,
 	root.PersistentFlags().StringVar(&flagConfigDir, "config-dir", "",
 		"identity/token directory (default ~/.config/outpost or platform equivalent); use distinct dirs to run multiple independent hosts")
 	root.AddCommand(startCmd(), pairCmd(), statusCmd(), revokeCmd(), devicesCmd(), restoreCmd(), versionCmd(), installCmd(), uninstallCmd())
+	root.AddCommand(lsCmd(), attachCmd(), newSessionCmd()) // local tmux-style session access
+
 	return root
 }
 

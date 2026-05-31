@@ -9,11 +9,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { FlatList, StyleSheet, View } from 'react-native';
 import {
-  ActivityIndicator, Appbar, Divider, HelperText, IconButton, List, Text,
-  useTheme,
+  Appbar, Button, Dialog, Divider, HelperText, IconButton, List,
+  Portal, Text, TextInput, useTheme,
 } from 'react-native-paper';
 import {
-  getActiveHostId, listHosts, removeHost, setActiveHostId, type Host,
+  getActiveHostId, listHosts, removeHost, saveHost, setActiveHostId, type Host,
 } from './hosts';
 import { PairFlow } from './PairFlow';
 import { type AppTheme } from './theme';
@@ -25,9 +25,11 @@ export function HostsManager({ mode, onBack }: { mode: 'login' | 'embedded'; onB
   const authed = useAuthed();
   const [hosts, setHosts]     = useState<Host[]>([]);
   const [activeId, setActiveId] = useState<string | null>(wsClient.activeHostId);
-  const [busy, setBusy]       = useState('');
   const [error, setError]     = useState('');
   const [adding, setAdding]   = useState(false);
+  // Rename dialog: the host being renamed + the working name (null = closed).
+  const [renaming, setRenaming] = useState<Host | null>(null);
+  const [nameInput, setNameInput] = useState('');
 
   const reload = useCallback(async () => {
     setHosts(await listHosts());
@@ -39,22 +41,36 @@ export function HostsManager({ mode, onBack }: { mode: 'login' | 'embedded'; onB
   const connectHost = useCallback(async (h: Host) => {
     if (h.id === wsClient.activeHostId && wsClient.isAuthed) { onBack?.(); return; }
     setError('');
-    setBusy(`Connecting to ${h.name}…`);
-    wsClient.disconnect();
-    wsClient.clearTokens();
-    wsClient.setTokens(h.access, h.refresh);
-    wsClient.activeHostId = h.id;
-    wsClient.activeHostName = h.name;
-    await setActiveHostId(h.id);
-    const ok = await wsClient.resume(h.url);
-    setBusy('');
-    if (ok) {
+    // Mark a deliberate switch so the auth gate shows a splash (not the login
+    // screen) during the brief unauthenticated window, and the tabs remount
+    // cleanly on the newly-selected host.
+    wsClient.beginSwitch();
+    try {
+      wsClient.disconnect();
+      wsClient.clearTokens();
+      wsClient.setTokens(h.access, h.refresh);
+      wsClient.setActiveHost(h.id, h.name);
+      await setActiveHostId(h.id);
+      const ok = await wsClient.resume(h.url);
       setActiveId(h.id);
-      onBack?.();
-    } else {
-      setError(`Could not authenticate with ${h.name}. It may have been revoked — remove and re-pair.`);
+      if (!ok) {
+        setError(`Could not authenticate with ${h.name}. It may have been revoked — remove and re-pair.`);
+      }
+    } finally {
+      wsClient.endSwitch();
     }
   }, [onBack]);
+
+  const confirmRename = useCallback(async () => {
+    const h = renaming;
+    if (!h) return;
+    const name = nameInput.trim() || h.name;
+    await saveHost({ ...h, name }); // persisted to the device's local store
+    if (h.id === wsClient.activeHostId) wsClient.setActiveHost(h.id, name);
+    setRenaming(null);
+    setNameInput('');
+    await reload();
+  }, [renaming, nameInput, reload]);
 
   const onRemove = useCallback(async (h: Host) => {
     if (h.id === wsClient.activeHostId) {
@@ -78,15 +94,6 @@ export function HostsManager({ mode, onBack }: { mode: 'login' | 'embedded'; onB
   // Login with no saved hosts → go straight to pairing.
   if (mode === 'login' && hosts.length === 0) {
     return <PairFlow onDone={() => { /* auth gate switches to tabs */ }} />;
-  }
-
-  if (busy) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" />
-        <Text variant="bodyMedium" style={styles.busy}>{busy}</Text>
-      </View>
-    );
   }
 
   return (
@@ -125,20 +132,47 @@ export function HostsManager({ mode, onBack }: { mode: 'login' | 'embedded'; onB
                 />
               )}
               right={() => (
-                <IconButton icon="trash-can-outline" iconColor={theme.colors.error} onPress={() => onRemove(item)} />
+                <View style={styles.actions}>
+                  <IconButton
+                    icon="pencil-outline"
+                    onPress={() => { setNameInput(item.name); setRenaming(item); }}
+                  />
+                  <IconButton icon="trash-can-outline" iconColor={theme.colors.error} onPress={() => onRemove(item)} />
+                </View>
               )}
             />
           );
         }}
       />
+
+      <Portal>
+        <Dialog visible={!!renaming} onDismiss={() => setRenaming(null)}>
+          <Dialog.Title>Rename host</Dialog.Title>
+          <Dialog.Content>
+            <TextInput
+              mode="outlined"
+              label="Host name"
+              value={nameInput}
+              onChangeText={setNameInput}
+              autoFocus
+              autoCapitalize="none"
+              returnKeyType="done"
+              onSubmitEditing={confirmRename}
+            />
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setRenaming(null)}>Cancel</Button>
+            <Button onPress={confirmRename}>Save</Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  flex:   { flex: 1 },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
-  busy:   { marginTop: 16 },
-  mono:   { fontFamily: 'monospace' },
-  empty:  { textAlign: 'center', marginTop: 40, paddingHorizontal: 24 },
+  flex:    { flex: 1 },
+  actions: { flexDirection: 'row', alignItems: 'center' },
+  mono:    { fontFamily: 'monospace' },
+  empty:   { textAlign: 'center', marginTop: 40, paddingHorizontal: 24 },
 });

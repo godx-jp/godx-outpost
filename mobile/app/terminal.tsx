@@ -37,7 +37,7 @@ import { BinaryKind, Ch, type Envelope } from '../lib/protocol';
 import { getDefaultDir } from '../lib/settings';
 import { takeTermLaunch } from '../lib/termLaunch';
 import { TermToolbar } from '../lib/TermToolbar';
-import { useAuthed } from '../lib/useConn';
+import { useActiveHostName, useAuthed } from '../lib/useConn';
 import { wsClient } from '../lib/ws';
 
 // Encode a string to UTF-8 bytes (TextEncoder isn't guaranteed in RN's engine).
@@ -197,6 +197,7 @@ export default function TerminalScreen() {
   const [landscape, setLandscape] = useState(false);
   const [uploading, setUploading] = useState(false);
   const authed = useAuthed();
+  const hostName = useActiveHostName() ?? 'host';
 
   // iOS uses the native SwiftTerm view (real IME / Vietnamese, native scroll);
   // web/Android fall back to the xterm.js WebView.
@@ -714,7 +715,7 @@ export default function TerminalScreen() {
   return (
     <View style={styles.flex}>
       <Appbar.Header mode="small">
-        <Appbar.Content title="Sessions" subtitle={wsClient.activeHostName ?? 'host'} />
+        <Appbar.Content title="Sessions" subtitle={hostName} />
         <Appbar.Action icon="refresh" onPress={refreshList} />
       </Appbar.Header>
 

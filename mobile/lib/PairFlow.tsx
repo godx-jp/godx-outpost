@@ -21,6 +21,7 @@ export function PairFlow({ onDone, onBack }: { onDone: () => void; onBack?: () =
   const [mode, setMode]   = useState<'form' | 'scan'>('form');
   const [url, setUrl]     = useState(DEFAULT_URL);
   const [code, setCode]   = useState('');
+  const [name, setName]   = useState('');
   const [busy, setBusy]   = useState('');
   const [error, setError] = useState('');
   const scannedRef = useRef(false);
@@ -35,12 +36,12 @@ export function PairFlow({ onDone, onBack }: { onDone: () => void; onBack?: () =
       setBusy('Pairing…');
       const r = await wsClient.pair(c);
       const host: Host = {
-        id: r.deviceId, name: defaultHostName(u), url: u, access: r.access, refresh: r.refresh,
+        id: r.deviceId, name: name.trim() || defaultHostName(u), url: u,
+        access: r.access, refresh: r.refresh,
       };
-      await saveHost(host);
+      await saveHost(host); // saved to the device's local store
       await setActiveHostId(host.id);
-      wsClient.activeHostId = host.id;
-      wsClient.activeHostName = host.name;
+      wsClient.setActiveHost(host.id, host.name);
       setBusy('');
       setCode('');
       onDone();
@@ -48,7 +49,7 @@ export function PairFlow({ onDone, onBack }: { onDone: () => void; onBack?: () =
       setBusy('');
       setError((e as Error).message ?? 'Pairing failed');
     }
-  }, [onDone]);
+  }, [onDone, name]);
 
   const handleBarcode = useCallback(({ data }: { data: string }) => {
     if (scannedRef.current) return;
@@ -74,8 +75,7 @@ export function PairFlow({ onDone, onBack }: { onDone: () => void; onBack?: () =
           wsClient.disconnect();
           wsClient.clearTokens();
           wsClient.setTokens(existing.access, existing.refresh);
-          wsClient.activeHostId = existing.id;
-          wsClient.activeHostName = existing.name;
+          wsClient.setActiveHost(existing.id, existing.name);
           await setActiveHostId(existing.id);
           const ok = await wsClient.resume(existing.url);
           setBusy('');
@@ -149,8 +149,14 @@ export function PairFlow({ onDone, onBack }: { onDone: () => void; onBack?: () =
         <TextInput
           mode="outlined" label="Pairing Code" value={code} onChangeText={setCode}
           autoCapitalize="none" autoCorrect={false} placeholder="123456"
-          keyboardType="number-pad" maxLength={8} returnKeyType="go"
-          onSubmitEditing={() => pair(url.trim(), code.trim())} style={styles.field}
+          keyboardType="number-pad" maxLength={8} returnKeyType="next"
+          style={styles.field}
+        />
+        <TextInput
+          mode="outlined" label="Host name (optional)" value={name} onChangeText={setName}
+          autoCapitalize="none" autoCorrect={false} placeholder="e.g. MacBook, dev-server"
+          returnKeyType="go" onSubmitEditing={() => pair(url.trim(), code.trim())}
+          style={styles.field}
         />
         <Button mode="contained" onPress={() => pair(url.trim(), code.trim())} style={styles.gap}>
           Pair

@@ -9,7 +9,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { getActiveHostId, getHost, updateHostTokens } from '../lib/hosts';
 import { HostsManager } from '../lib/HostsManager';
 import { navTheme, theme } from '../lib/theme';
-import { useAuthed } from '../lib/useConn';
+import { useAuthed, useSwitching } from '../lib/useConn';
 import { wsClient } from '../lib/ws';
 
 // Tab bar icons (Ionicons). Colour is supplied by the navigator from navTheme.
@@ -27,6 +27,7 @@ export default function RootLayout() {
   // login screen before an auto-reconnect to the last host completes).
   const [booting, setBooting] = useState(true);
   const authed = useAuthed();
+  const switching = useSwitching();
 
   useEffect(() => {
     wsClient.onError = (message) => {
@@ -74,10 +75,12 @@ export default function RootLayout() {
       >
         <ThemeProvider value={navTheme}>
           <StatusBar style="light" />
-          {booting ? (
+          {booting || switching ? (
             <View style={styles.center}>
               <ActivityIndicator size="large" />
-              <Text variant="bodyMedium" style={styles.bootMsg}>Connecting…</Text>
+              <Text variant="bodyMedium" style={styles.bootMsg}>
+                {switching ? 'Switching host…' : 'Connecting…'}
+              </Text>
             </View>
           ) : !authed ? (
             <HostsManager mode="login" />

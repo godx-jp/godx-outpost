@@ -21,7 +21,7 @@ import {
 } from 'react-native-paper';
 import { Ch, type Envelope } from '../lib/protocol';
 import { type AppTheme, usageColor } from '../lib/theme';
-import { useAuthed } from '../lib/useConn';
+import { useActiveHostName, useAuthed } from '../lib/useConn';
 import { wsClient } from '../lib/ws';
 
 interface DiskStat { path: string; total: number; used: number; pct: number }
@@ -42,6 +42,7 @@ const SUBSCRIBE_INTERVAL_MS = 1500;
 
 export default function MonitorScreen() {
   const authed = useAuthed();
+  const host = useActiveHostName() ?? 'host';
   const [m, setM]           = useState<Metrics | null>(null);
   const [net, setNet]       = useState<{ up: number; down: number }>({ up: 0, down: 0 });
   const [paused, setPaused] = useState(false);
@@ -114,8 +115,6 @@ export default function MonitorScreen() {
       </View>
     );
   }
-
-  const host = wsClient.activeHostName ?? 'host';
 
   return (
     <View style={styles.flex}>

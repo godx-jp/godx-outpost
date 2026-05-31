@@ -29,16 +29,20 @@ interface KVStore {
 }
 
 let _store: KVStore | null = null;
+let _storePromise: Promise<KVStore> | null = null;
+let _storageWarned = false;
+
+// hasLocalStorage reports whether a persistent web localStorage is available.
+function hasLocalStorage(): boolean {
+  return typeof globalThis !== 'undefined' && !!(globalThis as { localStorage?: Storage }).localStorage;
+}
 
 // fallbackStore persists via localStorage when available (web) and otherwise
 // keeps values in memory (last resort). Used when expo-secure-store is not
 // available — notably on web, where it isn't supported.
 function fallbackStore(): KVStore {
-  const ls =
-    typeof globalThis !== 'undefined' && (globalThis as { localStorage?: Storage }).localStorage
-      ? (globalThis as { localStorage: Storage }).localStorage
-      : null;
-  if (ls) {
+  if (hasLocalStorage()) {
+    const ls = (globalThis as { localStorage: Storage }).localStorage;
     return {
       getItemAsync: async (k) => ls.getItem(k),
       setItemAsync: async (k, v) => ls.setItem(k, v),
@@ -53,22 +57,38 @@ function fallbackStore(): KVStore {
   };
 }
 
-async function secureStore(): Promise<KVStore> {
-  if (_store) return _store;
+// initStore resolves the persistence backend ONCE. expo-secure-store (Keychain/
+// Keystore) on native, localStorage on web. If neither is available we'd fall
+// back to an in-memory map — which silently loses tokens on restart — so we
+// surface that instead of failing silently.
+async function initStore(): Promise<KVStore> {
   try {
     const mod = (await import('expo-secure-store')) as unknown as KVStore & {
       isAvailableAsync?: () => Promise<boolean>;
     };
     const available = mod.isAvailableAsync ? await mod.isAvailableAsync() : true;
-    if (available && typeof mod.getItemAsync === 'function') {
-      _store = mod;
-      return _store;
-    }
+    if (available && typeof mod.getItemAsync === 'function') return mod;
   } catch {
     /* fall through to fallback */
   }
-  _store = fallbackStore();
-  return _store;
+  if (!hasLocalStorage() && !_storageWarned) {
+    _storageWarned = true;
+    // Reported via the global error surface (wsClient.onError → Snackbar) so the
+    // user knows logins won't persist instead of mysteriously re-pairing.
+    try {
+      wsClient.onError?.('Bộ nhớ bảo mật không khả dụng — đăng nhập sẽ không được lưu sau khi đóng app.');
+    } catch { /* wsClient not ready yet */ }
+  }
+  return fallbackStore();
+}
+
+// secureStore returns the (memoized) persistence backend, resolving it exactly
+// once even under concurrent first calls (a double-init race could otherwise
+// latch onto the in-memory fallback).
+async function secureStore(): Promise<KVStore> {
+  if (_store) return _store;
+  if (!_storePromise) _storePromise = initStore().then((s) => (_store = s));
+  return _storePromise;
 }
 
 /** Persisted convenience storage (host URL, last device) — same backend as tokens. */
@@ -192,6 +212,11 @@ export class Client {
   activeHostId: string | null = null;
   activeHostName: string | null = null;
 
+  // True while deliberately switching hosts (disconnect old → connect new). The
+  // auth gate shows a "Connecting…" splash instead of flashing the login screen
+  // during the brief unauthenticated window.
+  switching = false;
+
   // Active host's credentials, held in memory (persistence is per-host, in
   // lib/hosts.ts). Seed via setTokens() before connect()/resume().
   private _access:  string | null = null;
@@ -206,6 +231,17 @@ export class Client {
   addChangeListener(fn: () => void): () => void {
     this.changeListeners.add(fn);
     return () => this.changeListeners.delete(fn);
+  }
+
+  /** Mark the start/end of a deliberate host switch (drives the gate splash). */
+  beginSwitch(): void { this.switching = true; this.notifyChange(); }
+  endSwitch(): void { this.switching = false; this.notifyChange(); }
+
+  /** Set the active host's display name and notify subscribers (reactive). */
+  setActiveHost(id: string | null, name: string | null): void {
+    this.activeHostId = id;
+    this.activeHostName = name;
+    this.notifyChange();
   }
 
   private notifyChange(): void {

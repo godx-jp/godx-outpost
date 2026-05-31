@@ -19,3 +19,25 @@ export function useAuthed(): boolean {
   }, []);
   return authed;
 }
+
+/** The active host's display name, reactive to connect/switch/rename. */
+export function useActiveHostName(): string | null {
+  const [name, setName] = useState(wsClient.activeHostName);
+  useEffect(() => {
+    const update = () => setName(wsClient.activeHostName);
+    update();
+    return wsClient.addChangeListener(update);
+  }, []);
+  return name;
+}
+
+/** True while a deliberate host switch is in progress. Re-renders on change. */
+export function useSwitching(): boolean {
+  const [s, setS] = useState(wsClient.switching);
+  useEffect(() => {
+    const update = () => setS(wsClient.switching);
+    update();
+    return wsClient.addChangeListener(update);
+  }, []);
+  return s;
+}
